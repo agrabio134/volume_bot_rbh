@@ -1,0 +1,4 @@
+node_modules
+.env
+privekey.txt
+trash.txt
