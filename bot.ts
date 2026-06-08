@@ -559,6 +559,6 @@ bot.on('message', async (msg) => {
   } else if (state.step === 'payment' && text.toUpperCase() === 'PAID') {
     handlePayment(chatId, state.expected, state);
   }
-});
+}); 
 
 log('✅ Multi-user Volume Bot started - Minimum 3000 MON Package');
