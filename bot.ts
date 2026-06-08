@@ -119,24 +119,23 @@ async function executeSwap(walletPk: string, tokenCA: string, isBuy: boolean, pa
 
   if (isBuy) {
     let amount: number;
-    // Aggressive volume based on 0.02 MON base + package scaling
-    if (packageType === 'test') {
-      amount = [0.035, 0.055, 0.075][Math.floor(Math.random() * 3)]; // Increased for better volume
+    if (packageType === '3k') {
+      amount = [0.25, 0.35, 0.45, 0.55][Math.floor(Math.random() * 4)];
     } else if (packageType === '5k') {
-      amount = [0.18, 0.25, 0.32, 0.4][Math.floor(Math.random() * 4)];
+      amount = [0.45, 0.6, 0.75, 0.9][Math.floor(Math.random() * 4)];
     } else if (packageType === '15k') {
-      amount = [0.55, 0.7, 0.85, 1.0][Math.floor(Math.random() * 4)];
+      amount = [1.2, 1.5, 1.8, 2.2][Math.floor(Math.random() * 4)];
     } else {
-      amount = [1.1, 1.4, 1.7, 2.0][Math.floor(Math.random() * 4)]; // 30k package
+      amount = [2.2, 2.8, 3.4, 4.0][Math.floor(Math.random() * 4)]; // 30k
     }
 
-    // Make it more aggressive on short durations
-    const aggression = Math.min(2.2, 3600000 * 2 / durationMs); // up to 2.2x for 30min
+    const aggression = Math.min(2.5, 3600000 * 2.2 / durationMs);
     amount *= aggression;
 
-    const rawAmountIn = parseUnits(Math.min(amount, Number(formatUnits(monBalance * 45n / 100n, 18))).toString(), 18);
+    const maxSafe = Number(formatUnits(monBalance * 48n / 100n, 18));
+    const rawAmountIn = parseUnits(Math.min(amount, maxSafe).toString(), 18);
 
-    if (monBalance < rawAmountIn + parseUnits('0.005', 18)) throw new Error('Insufficient MON');
+    if (monBalance < rawAmountIn + parseUnits('0.008', 18)) throw new Error('Insufficient MON');
 
     const data = encodeFunctionData({
       abi: ROUTER_ABI,
@@ -148,14 +147,14 @@ async function executeSwap(walletPk: string, tokenCA: string, isBuy: boolean, pa
     await publicClient.waitForTransactionReceipt({ hash: txHash, confirmations: 1 });
   } else {
     let tokenBalance = 0n;
-    for (let i = 0; i < 12; i++) {
-      await sleep(600);
+    for (let i = 0; i < 10; i++) {
+      await sleep(500);
       tokenBalance = await publicClient.readContract({ address: tokenCA as `0x${string}`, abi: ERC20_ABI, functionName: 'balanceOf', args: [account.address] }) as bigint;
-      if (tokenBalance > parseUnits('0.8', tokenInfo.decimals)) break;
+      if (tokenBalance > parseUnits('1', tokenInfo.decimals)) break;
     }
-    if (tokenBalance < parseUnits('0.8', tokenInfo.decimals)) throw new Error('No tokens');
+    if (tokenBalance < parseUnits('1', tokenInfo.decimals)) throw new Error('No tokens');
 
-    const rawAmountIn = (tokenBalance * 94n) / 100n; // Sell almost everything
+    const rawAmountIn = (tokenBalance * 95n) / 100n;
 
     const allowance = await publicClient.readContract({ address: tokenCA as `0x${string}`, abi: ERC20_ABI, functionName: 'allowance', args: [account.address, router] }) as bigint;
     if (allowance < rawAmountIn) {
@@ -167,7 +166,7 @@ async function executeSwap(walletPk: string, tokenCA: string, isBuy: boolean, pa
         gas: 150000n,
       });
       await publicClient.waitForTransactionReceipt({ hash: approveTx, confirmations: 1 });
-      await sleep(1000);
+      await sleep(900);
     }
 
     const data = encodeFunctionData({
@@ -189,22 +188,22 @@ async function startVolume(chatId: number): Promise<void> {
   bot.sendMessage(chatId, `🚀 *Volume Bot Started*\n\n📛 Token: ${tokenInfo.name} (${tokenInfo.symbol})\n🔗 CA: \`${session.tokenCA}\`\n💎 Package: ${session.package}\n⏱ Duration: ${Math.floor(session.durationMs/3600000)}h ${Math.floor((session.durationMs%3600000)/60000)}m\n👥 Wallets: ${session.wallets.length}`, { parse_mode: 'Markdown' });
 
   while (session.running && Date.now() < endTime) {
-    if (session.paused) { await sleep(4000); continue; }
+    if (session.paused) { await sleep(3500); continue; }
 
     for (const w of session.wallets) {
       if (!session.running || Date.now() > endTime) break;
-      if (session.paused) { await sleep(800); continue; }
+      if (session.paused) { await sleep(700); continue; }
       try {
         await executeSwap(w.privateKey, session.tokenCA, true, session.package, session.durationMs);
-        await sleep(jitter(900, 1400));   // Faster cycles
+        await sleep(jitter(850, 1250));
         await executeSwap(w.privateKey, session.tokenCA, false, session.package, session.durationMs);
-        await sleep(jitter(1600, 2100));
+        await sleep(jitter(1450, 1950));
       } catch (e: any) {
         log(`Swap error chatId ${chatId}: ${e.message}`, 'ERROR');
-        await sleep(8000);
+        await sleep(7000);
       }
     }
-    await sleep(jitter(4200, 3800));
+    await sleep(jitter(3800, 3200));
   }
   session.running = false;
   bot.sendMessage(chatId, '🛑 Volume bot finished.').catch(() => {});
@@ -238,7 +237,7 @@ async function fundWallets(wallets: { privateKey: string }[], amountPerWallet: s
       const txHash = await wc.sendTransaction({ to: acc.address, value, gas: 21000n });
       await publicClient.waitForTransactionReceipt({ hash: txHash, confirmations: 1 });
     } catch {}
-    await sleep(450);
+    await sleep(400);
   }
 }
 
@@ -258,11 +257,11 @@ async function handlePayment(chatId: number, expectedAmount: string, state: any)
           await wc.sendTransaction({ to: COMMISSION_WALLET, value: commission, gas: 21000n });
         }
 
-        const walletCount = state.package === 'test' ? 25 : 5;
+        const walletCount = 5;
         const sessionWallets = generateWallets(walletCount);
         saveWalletsToFile(chatId, state.tokenCA, sessionWallets);
 
-        const usable = (balance * 78n) / 100n; // Increased usable %
+        const usable = (balance * 80n) / 100n;
         const perWallet = usable / BigInt(walletCount);
         await fundWallets(sessionWallets, formatUnits(perWallet, 18));
 
@@ -285,8 +284,6 @@ async function handlePayment(chatId: number, expectedAmount: string, state: any)
   userStates.delete(chatId);
   bot.sendMessage(chatId, '❌ Payment not detected.');
 }
-
-// ... (refundAllWallets, getAllPrivateKeysFromFolder, moveToArchive, refundAllAdmin, consolidateAllAdmin remain the same as your provided code) ...
 
 async function refundAllWallets(chatId: number): Promise<void> {
   const session = activeBots.get(chatId);
@@ -492,15 +489,15 @@ bot.on('callback_query', async (query) => {
     bot.sendMessage(chatId, '💎 *Choose Package*', {
       parse_mode: 'Markdown',
       reply_markup: { inline_keyboard: [
-        [{ text: '🧪 220 MON – Test (25 wallets)\n~8K-18K volume', callback_data: 'pkg_test' }],
-        [{ text: '🔥 5,000 MON\n~220K-380K volume', callback_data: 'pkg_5k' }],
-        [{ text: '💰 15,000 MON\n~650K-950K volume', callback_data: 'pkg_15k' }],
-        [{ text: '🌟 30,000 MON\n~1.3M-1.9M volume', callback_data: 'pkg_30k' }],
+        [{ text: '🔥 3,000 MON\n~180K-320K volume', callback_data: 'pkg_3k' }],
+        [{ text: '💎 5,000 MON\n~320K-520K volume', callback_data: 'pkg_5k' }],
+        [{ text: '🚀 15,000 MON\n~950K-1.4M volume', callback_data: 'pkg_15k' }],
+        [{ text: '🌟 30,000 MON\n~1.8M-2.6M volume', callback_data: 'pkg_30k' }],
       ]},
     });
   } else if (data.startsWith('pkg_')) {
     const pkgMap: Record<string, string> = { 
-      pkg_test: '220', 
+      pkg_3k: '3000', 
       pkg_5k: '5000', 
       pkg_15k: '15000',
       pkg_30k: '30000'
@@ -564,4 +561,4 @@ bot.on('message', async (msg) => {
   }
 });
 
-log('✅ Multi-user Volume Bot started - Aggressive Mode Activated');
+log('✅ Multi-user Volume Bot started - Minimum 3000 MON Package');
