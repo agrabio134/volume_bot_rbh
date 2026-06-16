@@ -118,24 +118,25 @@ async function executeSwap(walletPk: string, tokenCA: string, isBuy: boolean, pa
   const monBalance = await publicClient.getBalance({ address: account.address });
 
   if (isBuy) {
-    let amount: number;
+    let baseAmount: number;
+
     if (packageType === '3k') {
-      amount = [0.25, 0.35, 0.45, 0.55][Math.floor(Math.random() * 4)];
+      baseAmount = [42, 48, 55, 68][Math.floor(Math.random() * 4)];
     } else if (packageType === '5k') {
-      amount = [0.45, 0.6, 0.75, 0.9][Math.floor(Math.random() * 4)];
+      baseAmount = [68, 78, 90, 105][Math.floor(Math.random() * 4)];
     } else if (packageType === '15k') {
-      amount = [1.2, 1.5, 1.8, 2.2][Math.floor(Math.random() * 4)];
+      baseAmount = [165, 185, 215, 245][Math.floor(Math.random() * 4)];
     } else {
-      amount = [2.2, 2.8, 3.4, 4.0][Math.floor(Math.random() * 4)]; // 30k
+      baseAmount = [320, 360, 410, 460][Math.floor(Math.random() * 4)];
     }
 
-    const aggression = Math.min(2.5, 3600000 * 2.2 / durationMs);
-    amount *= aggression;
+    const aggression = Math.min(3.2, 3600000 * 3.0 / durationMs);
+    const amount = baseAmount * aggression;
 
-    const maxSafe = Number(formatUnits(monBalance * 48n / 100n, 18));
+    const maxSafe = Number(formatUnits(monBalance * 94n / 100n, 18));
     const rawAmountIn = parseUnits(Math.min(amount, maxSafe).toString(), 18);
 
-    if (monBalance < rawAmountIn + parseUnits('0.008', 18)) throw new Error('Insufficient MON');
+    if (monBalance < rawAmountIn + parseUnits('0.018', 18)) throw new Error('Insufficient MON for buy');
 
     const data = encodeFunctionData({
       abi: ROUTER_ABI,
@@ -143,30 +144,45 @@ async function executeSwap(walletPk: string, tokenCA: string, isBuy: boolean, pa
       args: [{ amountOutMin: 0n, token: tokenCA as `0x${string}`, to: account.address, deadline }],
     });
 
-    const txHash = await walletClient.sendTransaction({ to: router, data, value: rawAmountIn, gas: 850000n });
+    const txHash = await walletClient.sendTransaction({ 
+      to: router, data, value: rawAmountIn, gas: 950000n 
+    });
     await publicClient.waitForTransactionReceipt({ hash: txHash, confirmations: 1 });
   } else {
     let tokenBalance = 0n;
-    for (let i = 0; i < 10; i++) {
-      await sleep(500);
-      tokenBalance = await publicClient.readContract({ address: tokenCA as `0x${string}`, abi: ERC20_ABI, functionName: 'balanceOf', args: [account.address] }) as bigint;
-      if (tokenBalance > parseUnits('1', tokenInfo.decimals)) break;
+    for (let i = 0; i < 12; i++) {
+      await sleep(650);
+      tokenBalance = await publicClient.readContract({ 
+        address: tokenCA as `0x${string}`, 
+        abi: ERC20_ABI, 
+        functionName: 'balanceOf', 
+        args: [account.address] 
+      }) as bigint;
+      if (tokenBalance > parseUnits('15', tokenInfo.decimals)) break;
     }
-    if (tokenBalance < parseUnits('1', tokenInfo.decimals)) throw new Error('No tokens');
+    if (tokenBalance < parseUnits('15', tokenInfo.decimals)) throw new Error('No sufficient tokens to sell');
 
-    const rawAmountIn = (tokenBalance * 95n) / 100n;
+    // Stronger sell (97-99%) so money flows back to wallet
+    const sellPercentage = 9700n + BigInt(Math.floor(Math.random() * 200)); // 97% to 99%
+    const rawAmountIn = (tokenBalance * sellPercentage) / 10000n;
 
-    const allowance = await publicClient.readContract({ address: tokenCA as `0x${string}`, abi: ERC20_ABI, functionName: 'allowance', args: [account.address, router] }) as bigint;
+    const allowance = await publicClient.readContract({ 
+      address: tokenCA as `0x${string}`, 
+      abi: ERC20_ABI, 
+      functionName: 'allowance', 
+      args: [account.address, router] 
+    }) as bigint;
+
     if (allowance < rawAmountIn) {
       const approveTx = await walletClient.writeContract({
         address: tokenCA as `0x${string}`,
         abi: ERC20_ABI,
         functionName: 'approve',
         args: [router, BigInt('0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff')],
-        gas: 150000n,
+        gas: 170000n,
       });
       await publicClient.waitForTransactionReceipt({ hash: approveTx, confirmations: 1 });
-      await sleep(900);
+      await sleep(1350);
     }
 
     const data = encodeFunctionData({
@@ -175,7 +191,9 @@ async function executeSwap(walletPk: string, tokenCA: string, isBuy: boolean, pa
       args: [{ amountIn: rawAmountIn, amountOutMin: 0n, token: tokenCA as `0x${string}`, to: account.address, deadline }],
     });
 
-    const txHash = await walletClient.sendTransaction({ to: router, data, value: 0n, gas: 850000n });
+    const txHash = await walletClient.sendTransaction({ 
+      to: router, data, value: 0n, gas: 950000n 
+    });
     await publicClient.waitForTransactionReceipt({ hash: txHash, confirmations: 1 });
   }
 }
@@ -187,29 +205,40 @@ async function startVolume(chatId: number): Promise<void> {
 
   bot.sendMessage(chatId, `🚀 *Volume Bot Started*\n\n📛 Token: ${tokenInfo.name} (${tokenInfo.symbol})\n🔗 CA: \`${session.tokenCA}\`\n💎 Package: ${session.package}\n⏱ Duration: ${Math.floor(session.durationMs/3600000)}h ${Math.floor((session.durationMs%3600000)/60000)}m\n👥 Wallets: ${session.wallets.length}`, { parse_mode: 'Markdown' });
 
+  // Dynamic base delay based on total duration
+  const baseCycleDelay = Math.max(4500, Math.floor(session.durationMs / 180)); // Longer duration = slower cycles
+
   while (session.running && Date.now() < endTime) {
-    if (session.paused) { await sleep(3500); continue; }
+    if (session.paused) { await sleep(5000); continue; }
 
     for (const w of session.wallets) {
       if (!session.running || Date.now() > endTime) break;
-      if (session.paused) { await sleep(700); continue; }
+      if (session.paused) { await sleep(1200); continue; }
+
       try {
-        await executeSwap(w.privateKey, session.tokenCA, true, session.package, session.durationMs);
-        await sleep(jitter(850, 1250));
+        // 4 buys : 1 sell
+        for (let i = 0; i < 4; i++) {
+          await executeSwap(w.privateKey, session.tokenCA, true, session.package, session.durationMs);
+          await sleep(jitter(1350, 1850));
+        }
         await executeSwap(w.privateKey, session.tokenCA, false, session.package, session.durationMs);
-        await sleep(jitter(1450, 1950));
+        await sleep(jitter(2100, 2800));
       } catch (e: any) {
         log(`Swap error chatId ${chatId}: ${e.message}`, 'ERROR');
-        await sleep(7000);
+        await sleep(10000);
       }
     }
-    await sleep(jitter(3800, 3200));
+
+    // Duration-aware pause between full wallet cycles
+    const cyclePause = jitter(baseCycleDelay, baseCycleDelay * 0.6);
+    await sleep(Math.min(cyclePause, 25000)); // cap max delay
   }
+
   session.running = false;
   bot.sendMessage(chatId, '🛑 Volume bot finished.').catch(() => {});
 }
 
-function generateWallets(count = 5) {
+function generateWallets(count = 30) {
   const wallets: { privateKey: string }[] = [];
   for (let i = 0; i < count; i++) {
     const privateKey = '0x' + crypto.randomBytes(32).toString('hex');
@@ -236,8 +265,10 @@ async function fundWallets(wallets: { privateKey: string }[], amountPerWallet: s
       const acc = privateKeyToAccount(w.privateKey as `0x${string}`);
       const txHash = await wc.sendTransaction({ to: acc.address, value, gas: 21000n });
       await publicClient.waitForTransactionReceipt({ hash: txHash, confirmations: 1 });
-    } catch {}
-    await sleep(400);
+    } catch (e) {
+      log(`Funding failed for wallet: ${e}`, 'WARN');
+    }
+    await sleep(480);
   }
 }
 
@@ -257,7 +288,7 @@ async function handlePayment(chatId: number, expectedAmount: string, state: any)
           await wc.sendTransaction({ to: COMMISSION_WALLET, value: commission, gas: 21000n });
         }
 
-        const walletCount = 5;
+        const walletCount = 30;
         const sessionWallets = generateWallets(walletCount);
         saveWalletsToFile(chatId, state.tokenCA, sessionWallets);
 
@@ -285,6 +316,7 @@ async function handlePayment(chatId: number, expectedAmount: string, state: any)
   bot.sendMessage(chatId, '❌ Payment not detected.');
 }
 
+// === Admin & Other Functions (unchanged) ===
 async function refundAllWallets(chatId: number): Promise<void> {
   const session = activeBots.get(chatId);
   if (!session) {
@@ -301,7 +333,7 @@ async function refundAllWallets(chatId: number): Promise<void> {
         await wc2.sendTransaction({ to: MAIN_WALLET, value: balance - parseUnits('0.001', 18), gas: 21000n });
       }
     } catch {}
-    await sleep(600);
+    await sleep(650);
   }
   activeBots.delete(chatId);
   bot.sendMessage(chatId, '✅ Session refund completed.');
@@ -353,7 +385,7 @@ async function refundAllAdmin(chatId: number, key: string): Promise<void> {
         totalRefunded += sendAmount;
         success++;
       }
-      await sleep(800);
+      await sleep(850);
     } catch (e) {
       log(`Refund failed for key segment: ${pk.slice(0,10)}...`, 'ERROR');
     }
@@ -384,7 +416,7 @@ async function consolidateAllAdmin(chatId: number, key: string): Promise<void> {
       const wc = createWalletClient({ chain: monad, transport: http(process.env.RPC_URL!), account });
       const balance = await publicClient.getBalance({ address: account.address });
       if (balance < parseUnits("0.3", 18)) {
-        await sleep(600);
+        await sleep(650);
         continue;
       }
       const sendAmount = balance - parseUnits("0.25", 18);
@@ -398,7 +430,7 @@ async function consolidateAllAdmin(chatId: number, key: string): Promise<void> {
       await publicClient.waitForTransactionReceipt({ hash: txHash, confirmations: 1 });
       totalSent += sendAmount;
       success++;
-      await sleep(1200);
+      await sleep(1250);
     } catch (e) {
       log(`Consolidation failed for key: ${pk.slice(0,10)}...`, 'ERROR');
     }
@@ -561,4 +593,4 @@ bot.on('message', async (msg) => {
   }
 }); 
 
-log('✅ Multi-user Volume Bot started - Minimum 3000 MON Package');
+log('✅ Multi-user Volume Bot started - 30 wallets | 4:1 ratio | Duration-aware pacing + Stronger sells');
