@@ -295,9 +295,9 @@ async function main() {
     { command: 'disable', description: 'Disable alerts in this chat' },
   ]);
 
-  const setupKeyboard = () => ({ inline_keyboard: [
+  const setupKeyboard = (chatId: number) => ({ inline_keyboard: [
     [
-      { text: state.enabledChatIds.length ? '✅ Enable Here' : '🔔 Enable Here', callback_data: 'bb_enable' },
+      { text: state.enabledChatIds.includes(chatId) ? '✅ Alerts Enabled' : '🔔 Enable Here', callback_data: 'bb_enable' },
       { text: '🛑 Disable Here', callback_data: 'bb_disable' },
     ],
     [{ text: '🐋 Choose Whale Alert', callback_data: 'bb_whale_menu' }],
@@ -312,7 +312,7 @@ async function main() {
 
   const sendSetup = (chatId: number) => bot.sendMessage(chatId,
     `<b>⚙️ HUH Buybot Setup</b>\n\nAlerts in this chat: <b>${state.enabledChatIds.includes(chatId) ? 'ON ✅' : 'OFF'}</b>\nWhale alert: <b>${esc(state.whaleThresholdWeth)} WETH</b>\n\nTap a button below:`,
-    { parse_mode: 'HTML', reply_markup: setupKeyboard() });
+    { parse_mode: 'HTML', reply_markup: setupKeyboard(chatId) });
 
   bot.onText(/^\/start(?:@\w+)?$/, async msg => {
     if (await isAuthorized(msg.chat, msg.from?.id)) return void sendSetup(msg.chat.id);
@@ -321,6 +321,11 @@ async function main() {
 
   bot.onText(/^\/setup(?:@\w+)?$/, async msg => {
     if (!await isAuthorized(msg.chat, msg.from?.id)) return void bot.sendMessage(msg.chat.id, 'Unauthorized. Group administrators only.');
+    if (!state.enabledChatIds.includes(msg.chat.id)) {
+      state.enabledChatIds.push(msg.chat.id);
+      saveState();
+      await bot.sendMessage(msg.chat.id, `✅ Realtime ${symbol} buy alerts enabled in this chat.`);
+    }
     void sendSetup(msg.chat.id);
   });
 

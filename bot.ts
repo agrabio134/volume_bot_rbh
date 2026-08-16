@@ -38,16 +38,21 @@ const publicClient = createPublicClient({
   transport: http(getRpcUrl()),
 });
 
-const userStates = new Map<number, any>();
-const activeBots = new Map<number, { 
-  tokenCA: string; 
-  running: boolean; 
-  paused: boolean; 
-  package: string; 
+type BotMode = 'volume' | 'bump';
+
+type ActiveSession = {
+  tokenCA: string;
+  running: boolean;
+  paused: boolean;
+  package: string;
+  mode: BotMode;
   durationMs: number;
   wallets: { privateKey: string }[];
   startTime: number;
-}>();
+};
+
+const userStates = new Map<number, any>();
+const activeBots = new Map<number, ActiveSession>();
 
 const ERC20_ABI = [
   { name: 'balanceOf', type: 'function', inputs: [{ name: 'account', type: 'address' }], outputs: [{ type: 'uint256' }] },
@@ -126,7 +131,7 @@ async function getTokenInfo(tokenCA: string) {
   }
 }
 
-async function executeSwap(walletPk: string, tokenCA: string, isBuy: boolean, packageType: string, durationMs: number): Promise<void> {
+async function executeSwap(walletPk: string, tokenCA: string, isBuy: boolean, packageType: string, durationMs: number, mode: BotMode): Promise<void> {
   const account = privateKeyToAccount(walletPk as `0x${string}`);
   const walletClient = createWalletClient({ chain: robinhood, transport: http(getRpcUrl()), account });
   const tokenInfo = await getTokenInfo(tokenCA);
@@ -169,8 +174,10 @@ async function executeSwap(walletPk: string, tokenCA: string, isBuy: boolean, pa
     }
     if (tokenBalance < parseUnits('15', tokenInfo.decimals)) throw new Error('No sufficient tokens to sell');
 
-    // Stronger sell (97-99%) so money flows back to wallet
-    const sellPercentage = 9700n + BigInt(Math.floor(Math.random() * 200)); // 97% to 99%
+    // Bump mode varies the recycle amount more; volume mode preserves its original stronger sell.
+    const sellPercentage = mode === 'bump'
+      ? 9000n + BigInt(Math.floor(Math.random() * 700)) // 90% to 97%
+      : 9700n + BigInt(Math.floor(Math.random() * 200)); // 97% to 99%
     const rawAmountIn = (tokenBalance * sellPercentage) / 10000n;
 
     const allowance = await publicClient.readContract({ 
@@ -208,12 +215,21 @@ async function executeSwap(walletPk: string, tokenCA: string, isBuy: boolean, pa
   }
 }
 
+function chooseBuyCount(): number {
+  const roll = Math.random();
+  if (roll < 0.25) return 1;
+  if (roll < 0.85) return 2;
+  return 3;
+}
+
 async function startVolume(chatId: number): Promise<void> {
   const session = activeBots.get(chatId)!;
   const endTime = Date.now() + session.durationMs;
   const tokenInfo = await getTokenInfo(session.tokenCA);
+  const modeLabel = session.mode === 'bump' ? 'Random Bump Mode' : 'Volume Mode';
+  const ratioLabel = 'Random 1:1 / 2:1 / 3:1 (2:1 most common)';
 
-  bot.sendMessage(chatId, `🚀 *Volume Bot Started*\n\n📛 Token: ${tokenInfo.name} (${tokenInfo.symbol})\n🔗 CA: \`${session.tokenCA}\`\n💎 Package: ${session.package}\n⏱ Duration: ${Math.floor(session.durationMs/3600000)}h ${Math.floor((session.durationMs%3600000)/60000)}m\n👥 Wallets: ${session.wallets.length}`, { parse_mode: 'Markdown' });
+  bot.sendMessage(chatId, `🚀 *Bot Started*\n\n⚙️ Mode: ${modeLabel}\n📛 Token: ${tokenInfo.name} (${tokenInfo.symbol})\n🔗 CA: \`${session.tokenCA}\`\n💎 Package: ${session.package}\n⚖️ Ratio: ${ratioLabel}\n⏱ Duration: ${Math.floor(session.durationMs/3600000)}h ${Math.floor((session.durationMs%3600000)/60000)}m\n👥 Wallets: ${session.wallets.length}`, { parse_mode: 'Markdown' });
 
   // Dynamic base delay based on total duration
   const baseCycleDelay = Math.max(4500, Math.floor(session.durationMs / 180)); // Longer duration = slower cycles
@@ -226,13 +242,13 @@ async function startVolume(chatId: number): Promise<void> {
       if (session.paused) { await sleep(1200); continue; }
 
       try {
-        // 4 buys : 1 sell
-        for (let i = 0; i < 4; i++) {
-          await executeSwap(w.privateKey, session.tokenCA, true, session.package, session.durationMs);
-          await sleep(jitter(1350, 1850));
+        const buyCount = chooseBuyCount();
+        for (let i = 0; i < buyCount; i++) {
+          await executeSwap(w.privateKey, session.tokenCA, true, session.package, session.durationMs, session.mode);
+          await sleep(session.mode === 'bump' ? jitter(2400, 4800) : jitter(1350, 1850));
         }
-        await executeSwap(w.privateKey, session.tokenCA, false, session.package, session.durationMs);
-        await sleep(jitter(2100, 2800));
+        await executeSwap(w.privateKey, session.tokenCA, false, session.package, session.durationMs, session.mode);
+        await sleep(session.mode === 'bump' ? jitter(3800, 6200) : jitter(2100, 2800));
       } catch (e: any) {
         log(`Swap error chatId ${chatId}: ${e.message}`, 'ERROR');
         await sleep(10000);
@@ -240,8 +256,8 @@ async function startVolume(chatId: number): Promise<void> {
     }
 
     // Duration-aware pause between full wallet cycles
-    const cyclePause = jitter(baseCycleDelay, baseCycleDelay * 0.6);
-    await sleep(Math.min(cyclePause, 25000)); // cap max delay
+    const cyclePause = jitter(baseCycleDelay, baseCycleDelay * (session.mode === 'bump' ? 1.2 : 0.6));
+    await sleep(Math.min(cyclePause, session.mode === 'bump' ? 45000 : 25000));
   }
 
   session.running = false;
@@ -257,15 +273,22 @@ function generateWallets(count: number) {
   return wallets;
 }
 
-function getWalletCount(packageType: string): number {
-  const counts: Record<string, number> = {
-    test: 5,
-    starter: 10,
-    dolphin: 15,
-    whale: 20,
-    max: 30,
+function getWalletCount(packageType: string, mode: BotMode): number {
+  const volumeCounts: Record<string, number> = {
+    test: 2,
+    starter: 3,
+    dolphin: 4,
+    whale: 6,
+    max: 8,
   };
-  return counts[packageType] ?? 10;
+  const bumpCounts: Record<string, number> = {
+    test: 3,
+    starter: 3,
+    dolphin: 4,
+    whale: 5,
+    max: 5,
+  };
+  return (mode === 'bump' ? bumpCounts : volumeCounts)[packageType] ?? (mode === 'bump' ? 3 : 10);
 }
 
 function saveWalletsToFile(chatId: number, tokenCA: string, wallets: { privateKey: string }[]) {
@@ -320,7 +343,8 @@ async function handlePayment(chatId: number, expectedAmount: string, state: any)
           const commissionHash = await wc.sendTransaction({ to: COMMISSION_WALLET, value: commission, gas: 50000n });
           await publicClient.waitForTransactionReceipt({ hash: commissionHash, confirmations: 1 });
 
-          const walletCount = getWalletCount(state.package);
+          const mode: BotMode = state.mode === 'bump' ? 'bump' : 'volume';
+          const walletCount = getWalletCount(state.package, mode);
           const sessionWallets = generateWallets(walletCount);
           saveWalletsToFile(chatId, state.tokenCA, sessionWallets);
 
@@ -333,6 +357,7 @@ async function handlePayment(chatId: number, expectedAmount: string, state: any)
             running: true,
             paused: false,
             package: state.package,
+            mode,
             durationMs: state.durationMs,
             wallets: sessionWallets,
             startTime: Date.now()
@@ -486,10 +511,18 @@ async function consolidateAllAdmin(chatId: number, key: string): Promise<void> {
 // ==================== COMMANDS ====================
 
 bot.onText(/\/start/, (msg) => {
-  bot.sendMessage(msg.chat.id, '🚀 *Robinhood Chain HUH/WETH Volume Bot*', {
+  bot.sendMessage(msg.chat.id, '🚀 *Robinhood Chain HUH/WETH Trading Bot*', {
     parse_mode: 'Markdown',
-    reply_markup: { inline_keyboard: [[{ text: '🚀 Start New Boost', callback_data: 'start_boost' }]] },
+    reply_markup: { inline_keyboard: [
+      [{ text: '🚀 Start Volume Boost', callback_data: 'start_boost' }],
+      [{ text: '📈 Start Random Bump Mode', callback_data: 'start_bump' }],
+    ] },
   });
+});
+
+bot.onText(/^\/bump(?:@\w+)?$/, (msg) => {
+  userStates.set(msg.chat.id, { step: 'ca', mode: 'bump' as BotMode });
+  bot.sendMessage(msg.chat.id, '📈 *Random Bump Mode*\n\nUses 3–5 reusable wallets and random 1:1, 2:1 or 3:1 buy/sell cycles.\n\n🔗 Paste the token contract address (CA):', { parse_mode: 'Markdown' });
 });
 
 bot.onText(/\/myorders/, (msg) => {
@@ -497,7 +530,7 @@ bot.onText(/\/myorders/, (msg) => {
   const session = activeBots.get(chatId);
   if (!session) return bot.sendMessage(chatId, '📭 No active session. Use /start');
   const elapsed = Math.floor((Date.now() - session.startTime)/60000);
-  bot.sendMessage(chatId, `📊 *Active Volume*\nToken: \`${session.tokenCA}\`\nPackage: ${session.package}\nDuration: ${Math.floor(session.durationMs/3600000)}h\nElapsed: ${elapsed} min\nStatus: ${session.paused ? '⏸️ PAUSED' : '▶️ RUNNING'}`, {
+  bot.sendMessage(chatId, `📊 *Active Session*\nMode: ${session.mode === 'bump' ? 'Random Bump' : 'Volume'}\nToken: \`${session.tokenCA}\`\nPackage: ${session.package}\nWallets: ${session.wallets.length}\nDuration: ${Math.floor(session.durationMs/3600000)}h\nElapsed: ${elapsed} min\nStatus: ${session.paused ? '⏸️ PAUSED' : '▶️ RUNNING'}`, {
     parse_mode: 'Markdown',
     reply_markup: { inline_keyboard: [
       [{ text: session.paused ? '▶️ Resume' : '⏸️ Pause', callback_data: session.paused ? 'resume' : 'pause' }],
@@ -509,7 +542,7 @@ bot.onText(/\/myorders/, (msg) => {
 bot.onText(/\/status/, (msg) => {
   const session = activeBots.get(msg.chat.id);
   if (!session) return bot.sendMessage(msg.chat.id, 'No active volume.');
-  bot.sendMessage(msg.chat.id, `🔍 Status:\nToken: ${session.tokenCA}\nRunning: ${session.running}\nPaused: ${session.paused}`);
+  bot.sendMessage(msg.chat.id, `🔍 Status:\nMode: ${session.mode}\nToken: ${session.tokenCA}\nWallets: ${session.wallets.length}\nRunning: ${session.running}\nPaused: ${session.paused}`);
 });
 
 bot.onText(/\/status_admin (\S+)/, async (msg, match) => {
@@ -518,7 +551,7 @@ bot.onText(/\/status_admin (\S+)/, async (msg, match) => {
     const sessions = Array.from(activeBots.entries());
     let text = `👑 *Admin Status*\nTotal Active Sessions: ${sessions.length}\n\n`;
     sessions.forEach(([id, s]) => {
-      text += `Chat ${id}: ${s.tokenCA} | ${s.package} | ${s.running ? 'RUNNING' : 'STOPPED'}\n`;
+      text += `Chat ${id}: ${s.tokenCA} | ${s.mode} | ${s.package} | ${s.wallets.length} wallets | ${s.running ? 'RUNNING' : 'STOPPED'}\n`;
     });
     bot.sendMessage(msg.chat.id, text, { parse_mode: 'Markdown' });
   } else {
@@ -546,7 +579,8 @@ bot.onText(/\/help/, (msg) => {
   bot.sendMessage(msg.chat.id, 
 `📋 *Available Commands*
 
-/start - Start new volume
+/start - Choose volume or bump mode
+/bump - Start random bump mode
 /myorders - View active session
 /status - Check current status
 /active - Check if you have running bot
@@ -573,8 +607,11 @@ bot.on('callback_query', async (query) => {
   bot.answerCallbackQuery(query.id).catch(() => {});
 
   if (data === 'start_boost') {
-    userStates.set(chatId, { step: 'ca' });
+    userStates.set(chatId, { step: 'ca', mode: 'volume' as BotMode });
     bot.sendMessage(chatId, '🔗 Paste the token contract address (CA):');
+  } else if (data === 'start_bump') {
+    userStates.set(chatId, { step: 'ca', mode: 'bump' as BotMode });
+    bot.sendMessage(chatId, '📈 *Random Bump Mode*\n\nUses 3–5 reusable wallets and random 1:1, 2:1 or 3:1 buy/sell cycles.\n\n🔗 Paste the token contract address (CA):', { parse_mode: 'Markdown' });
   } else if (data.startsWith('pkg_')) {
     const pkgMap: Record<string, string> = { 
       pkg_test: '0.02',
@@ -610,7 +647,9 @@ bot.on('callback_query', async (query) => {
     if (state) {
       state.durationMs = minutes * 60 * 1000;
       state.step = 'confirm';
-      bot.sendMessage(chatId, `✅ Package and duration selected.\n\nReply *YES* to continue with \`${state.tokenCA}\`.`, { parse_mode: 'Markdown' });
+      const selectedMode = state.mode === 'bump' ? 'Random Bump' : 'Volume';
+      const walletCount = getWalletCount(state.package, state.mode === 'bump' ? 'bump' : 'volume');
+      bot.sendMessage(chatId, `✅ Package and duration selected.\n\nMode: *${selectedMode}*\nWallets: *${walletCount}*\nRatio: *Random 1:1 / 2:1 / 3:1*\n\nReply *YES* to continue with \`${state.tokenCA}\`.`, { parse_mode: 'Markdown' });
     }
   } else if (data === 'pause') {
     const s = activeBots.get(chatId); if (s) s.paused = true;
@@ -648,4 +687,4 @@ bot.on('message', async (msg) => {
   }
 }); 
 
-log('✅ Multi-user Volume Bot started - dynamic wallets (5-30) | 4:1 ratio | Duration-aware pacing + Stronger sells');
+log('✅ Multi-user Trading Bot started - reduced wallets + weighted random 1:1/2:1/3:1 ratios');
