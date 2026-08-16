@@ -1,0 +1,29 @@
+services:
+  - type: worker
+    name: huh-telegram-bots
+    runtime: node
+    plan: starter
+    region: singapore
+    buildCommand: npm ci && npm run build
+    startCommand: npm start
+    envVars:
+      - key: NODE_VERSION
+        value: 22.22.0
+      - key: BOT_TOKEN
+        sync: false
+      - key: BUYBOT_TOKEN
+        sync: false
+      - key: RPC_URL
+        sync: false
+      - key: PRIVATE_KEY
+        sync: false
+      - key: ADMIN_CHAT_ID
+        sync: false
+      - key: BUYBOT_ADMIN_USER_ID
+        sync: false
+      - key: DATA_DIR
+        value: /data
+    disk:
+      name: huh-bot-data
+      mountPath: /data
+      sizeGB: 1

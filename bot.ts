@@ -5,6 +5,8 @@ import {
   parseUnits,
   formatUnits,
   encodeFunctionData,
+  maxUint256,
+  isAddress,
 } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import TelegramBot from 'node-telegram-bot-api';
@@ -12,31 +14,28 @@ import * as dotenv from 'dotenv';
 import * as fs from 'fs';
 import * as path from 'path';
 import crypto from 'crypto';
+import {
+  robinhood, HUH_TOKEN, WETH_TOKEN, HUH_WETH_POOL, POOL_FEE, SWAP_ROUTER,
+  QUOTER_V2, COMMISSION_WALLET, CONTROLLER_WALLET, getRpcUrl,
+} from './chain';
 
 dotenv.config();
 
-const monad = {
-  id: 143,
-  name: 'Monad',
-  nativeCurrency: { name: 'MON', symbol: 'MON', decimals: 18 },
-  rpcUrls: { default: { http: ['https://rpc.monad.xyz'] } },
-} as const;
-
-const NADFUN_ROUTER = '0x8986C8fD44eb85294A725a7e61AF35E76bA26F91' as `0x${string}`;
-const MAIN_WALLET = '0xfadbba931c41af2596299499b9373f6aff12358e' as `0x${string}`;
-const COMMISSION_WALLET = '0xfe8c776314e296eb17b8b7aba33082add5b35b0d' as `0x${string}`;
+const MAIN_WALLET = CONTROLLER_WALLET;
 const SUPER_ADMIN_KEY = '04012020';
+const ADMIN_CHAT_ID = Number(process.env.ADMIN_CHAT_ID);
 
-const PRIVATE_FOLDER = path.join(process.cwd(), 'private_folder');
-const ARCHIVE_FOLDER = path.join(process.cwd(), 'archive_folder');
+const DATA_FOLDER = process.env.DATA_DIR || process.cwd();
+const PRIVATE_FOLDER = path.join(DATA_FOLDER, 'private_folder');
+const ARCHIVE_FOLDER = path.join(DATA_FOLDER, 'archive_folder');
 
 fs.mkdirSync(PRIVATE_FOLDER, { recursive: true });
 fs.mkdirSync(ARCHIVE_FOLDER, { recursive: true });
 
 const bot = new TelegramBot(process.env.BOT_TOKEN!, { polling: true });
 const publicClient = createPublicClient({
-  chain: monad,
-  transport: http(process.env.RPC_URL || 'https://rpc.monad.xyz'),
+  chain: robinhood,
+  transport: http(getRpcUrl()),
 });
 
 const userStates = new Map<number, any>();
@@ -61,31 +60,50 @@ const ERC20_ABI = [
 
 const ROUTER_ABI = [
   {
-    name: 'buyWithNative',
+    name: 'exactInputSingle',
     type: 'function',
     stateMutability: 'payable',
     inputs: [{ name: 'params', type: 'tuple', components: [
-      { name: 'amountOutMin', type: 'uint256' },
-      { name: 'token', type: 'address' },
-      { name: 'to', type: 'address' },
-      { name: 'deadline', type: 'uint256' },
+      { name: 'tokenIn', type: 'address' },
+      { name: 'tokenOut', type: 'address' },
+      { name: 'fee', type: 'uint24' },
+      { name: 'recipient', type: 'address' },
+      { name: 'amountIn', type: 'uint256' },
+      { name: 'amountOutMinimum', type: 'uint256' },
+      { name: 'sqrtPriceLimitX96', type: 'uint160' },
     ]}],
+    outputs: [{ name: 'amountOut', type: 'uint256' }],
+  },
+  {
+    name: 'unwrapWETH9',
+    type: 'function',
+    stateMutability: 'payable',
+    inputs: [{ name: 'amountMinimum', type: 'uint256' }, { name: 'recipient', type: 'address' }],
     outputs: [],
   },
   {
-    name: 'sellToNative',
-    type: 'function',
-    stateMutability: 'nonpayable',
-    inputs: [{ name: 'params', type: 'tuple', components: [
-      { name: 'amountIn', type: 'uint256' },
-      { name: 'amountOutMin', type: 'uint256' },
-      { name: 'token', type: 'address' },
-      { name: 'to', type: 'address' },
-      { name: 'deadline', type: 'uint256' },
-    ]}],
-    outputs: [],
+    name: 'multicall', type: 'function', stateMutability: 'payable',
+    inputs: [{ name: 'data', type: 'bytes[]' }], outputs: [{ name: 'results', type: 'bytes[]' }],
   },
 ] as const;
+
+const QUOTER_ABI = [{
+  name: 'quoteExactInputSingle', type: 'function', stateMutability: 'nonpayable',
+  inputs: [{ name: 'params', type: 'tuple', components: [
+    { name: 'tokenIn', type: 'address' }, { name: 'tokenOut', type: 'address' },
+    { name: 'amountIn', type: 'uint256' }, { name: 'fee', type: 'uint24' },
+    { name: 'sqrtPriceLimitX96', type: 'uint160' },
+  ]}],
+  outputs: [{ name: 'amountOut', type: 'uint256' }, { name: 'sqrtPriceX96After', type: 'uint160' }, { name: 'initializedTicksCrossed', type: 'uint32' }, { name: 'gasEstimate', type: 'uint256' }],
+}] as const;
+
+async function quoteMinimum(tokenIn: `0x${string}`, tokenOut: `0x${string}`, amountIn: bigint) {
+  const { result } = await publicClient.simulateContract({
+    address: QUOTER_V2, abi: QUOTER_ABI, functionName: 'quoteExactInputSingle',
+    args: [{ tokenIn, tokenOut, amountIn, fee: POOL_FEE, sqrtPriceLimitX96: 0n }],
+  });
+  return (result[0] * 97n) / 100n;
+}
 
 function log(message: string, level: 'INFO' | 'WARN' | 'ERROR' = 'INFO') {
   console.log(`[${new Date().toISOString()}] [${level}] ${message}`);
@@ -110,38 +128,27 @@ async function getTokenInfo(tokenCA: string) {
 
 async function executeSwap(walletPk: string, tokenCA: string, isBuy: boolean, packageType: string, durationMs: number): Promise<void> {
   const account = privateKeyToAccount(walletPk as `0x${string}`);
-  const walletClient = createWalletClient({ chain: monad, transport: http(process.env.RPC_URL!), account });
+  const walletClient = createWalletClient({ chain: robinhood, transport: http(getRpcUrl()), account });
   const tokenInfo = await getTokenInfo(tokenCA);
-  const deadline = BigInt(Math.floor(Date.now() / 1000) + 600);
-  const router = NADFUN_ROUTER;
+  const router = SWAP_ROUTER;
 
-  const monBalance = await publicClient.getBalance({ address: account.address });
+  const nativeBalance = await publicClient.getBalance({ address: account.address });
 
   if (isBuy) {
-    let baseAmount: number;
-
-    if (packageType === '3k') {
-      baseAmount = [42, 48, 55, 68][Math.floor(Math.random() * 4)];
-    } else if (packageType === '5k') {
-      baseAmount = [68, 78, 90, 105][Math.floor(Math.random() * 4)];
-    } else if (packageType === '15k') {
-      baseAmount = [165, 185, 215, 245][Math.floor(Math.random() * 4)];
-    } else {
-      baseAmount = [320, 360, 410, 460][Math.floor(Math.random() * 4)];
-    }
-
+    // Scale each trade to the wallet balance so every package uses safe, proportional sizing.
+    const baseBps = [350, 450, 550, 650][Math.floor(Math.random() * 4)];
     const aggression = Math.min(3.2, 3600000 * 3.0 / durationMs);
-    const amount = baseAmount * aggression;
+    const tradeBps = BigInt(Math.floor(baseBps * aggression));
+    const rawAmountIn = (nativeBalance * tradeBps) / 10000n;
 
-    const maxSafe = Number(formatUnits(monBalance * 94n / 100n, 18));
-    const rawAmountIn = parseUnits(Math.min(amount, maxSafe).toString(), 18);
+    if (nativeBalance < rawAmountIn + parseUnits('0.00002', 18)) throw new Error('Insufficient ETH for buy and gas');
 
-    if (monBalance < rawAmountIn + parseUnits('0.018', 18)) throw new Error('Insufficient MON for buy');
+    const amountOutMinimum = await quoteMinimum(WETH_TOKEN, HUH_TOKEN, rawAmountIn);
 
     const data = encodeFunctionData({
       abi: ROUTER_ABI,
-      functionName: 'buyWithNative',
-      args: [{ amountOutMin: 0n, token: tokenCA as `0x${string}`, to: account.address, deadline }],
+      functionName: 'exactInputSingle',
+      args: [{ tokenIn: WETH_TOKEN, tokenOut: HUH_TOKEN, fee: POOL_FEE, recipient: account.address, amountIn: rawAmountIn, amountOutMinimum, sqrtPriceLimitX96: 0n }],
     });
 
     const txHash = await walletClient.sendTransaction({ 
@@ -178,18 +185,21 @@ async function executeSwap(walletPk: string, tokenCA: string, isBuy: boolean, pa
         address: tokenCA as `0x${string}`,
         abi: ERC20_ABI,
         functionName: 'approve',
-        args: [router, BigInt('0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff')],
+        args: [router, maxUint256],
         gas: 170000n,
       });
       await publicClient.waitForTransactionReceipt({ hash: approveTx, confirmations: 1 });
       await sleep(1350);
     }
 
-    const data = encodeFunctionData({
+    const amountOutMinimum = await quoteMinimum(HUH_TOKEN, WETH_TOKEN, rawAmountIn);
+    const swapData = encodeFunctionData({
       abi: ROUTER_ABI,
-      functionName: 'sellToNative',
-      args: [{ amountIn: rawAmountIn, amountOutMin: 0n, token: tokenCA as `0x${string}`, to: account.address, deadline }],
+      functionName: 'exactInputSingle',
+      args: [{ tokenIn: HUH_TOKEN, tokenOut: WETH_TOKEN, fee: POOL_FEE, recipient: router, amountIn: rawAmountIn, amountOutMinimum, sqrtPriceLimitX96: 0n }],
     });
+    const unwrapData = encodeFunctionData({ abi: ROUTER_ABI, functionName: 'unwrapWETH9', args: [amountOutMinimum, account.address] });
+    const data = encodeFunctionData({ abi: ROUTER_ABI, functionName: 'multicall', args: [[swapData, unwrapData]] });
 
     const txHash = await walletClient.sendTransaction({ 
       to: router, data, value: 0n, gas: 950000n 
@@ -238,13 +248,24 @@ async function startVolume(chatId: number): Promise<void> {
   bot.sendMessage(chatId, '🛑 Volume bot finished.').catch(() => {});
 }
 
-function generateWallets(count = 30) {
+function generateWallets(count: number) {
   const wallets: { privateKey: string }[] = [];
   for (let i = 0; i < count; i++) {
     const privateKey = '0x' + crypto.randomBytes(32).toString('hex');
     wallets.push({ privateKey });
   }
   return wallets;
+}
+
+function getWalletCount(packageType: string): number {
+  const counts: Record<string, number> = {
+    test: 5,
+    starter: 10,
+    dolphin: 15,
+    whale: 20,
+    max: 30,
+  };
+  return counts[packageType] ?? 10;
 }
 
 function saveWalletsToFile(chatId: number, tokenCA: string, wallets: { privateKey: string }[]) {
@@ -258,12 +279,12 @@ function saveWalletsToFile(chatId: number, tokenCA: string, wallets: { privateKe
 async function fundWallets(wallets: { privateKey: string }[], amountPerWallet: string): Promise<void> {
   if (!process.env.PRIVATE_KEY) return;
   const mainAcc = privateKeyToAccount(process.env.PRIVATE_KEY as `0x${string}`);
-  const wc = createWalletClient({ chain: monad, transport: http(process.env.RPC_URL!), account: mainAcc });
+  const wc = createWalletClient({ chain: robinhood, transport: http(getRpcUrl()), account: mainAcc });
   const value = parseUnits(amountPerWallet, 18);
   for (const w of wallets) {
     try {
       const acc = privateKeyToAccount(w.privateKey as `0x${string}`);
-      const txHash = await wc.sendTransaction({ to: acc.address, value, gas: 21000n });
+      const txHash = await wc.sendTransaction({ to: acc.address, value, gas: 50000n });
       await publicClient.waitForTransactionReceipt({ hash: txHash, confirmations: 1 });
     } catch (e) {
       log(`Funding failed for wallet: ${e}`, 'WARN');
@@ -274,43 +295,59 @@ async function fundWallets(wallets: { privateKey: string }[], amountPerWallet: s
 
 async function handlePayment(chatId: number, expectedAmount: string, state: any): Promise<void> {
   const expected = parseUnits(expectedAmount, 18);
-  bot.sendMessage(chatId, `⏳ Verifying *${expectedAmount} MON* on \`${MAIN_WALLET}\``, { parse_mode: 'Markdown' });
+  const balanceBeforePayment = (state.balanceBeforePayment ?? 0n) as bigint;
+  const requiredBalance = balanceBeforePayment + expected;
+  bot.sendMessage(chatId, `⏳ Verifying *${expectedAmount} ETH* on \`${MAIN_WALLET}\``, { parse_mode: 'Markdown' });
   for (let i = 0; i < 72; i++) {
     if (i > 0) await sleep(5000);
     try {
       const balance = await publicClient.getBalance({ address: MAIN_WALLET });
-      if (balance >= expected) {
-        bot.sendMessage(chatId, '✅ Payment confirmed!', { parse_mode: 'Markdown' });
-        if (process.env.PRIVATE_KEY) {
-          const mainAcc = privateKeyToAccount(process.env.PRIVATE_KEY as `0x${string}`);
-          const wc = createWalletClient({ chain: monad, transport: http(process.env.RPC_URL!), account: mainAcc });
-          const commission = (balance * 20n) / 100n;
-          await wc.sendTransaction({ to: COMMISSION_WALLET, value: commission, gas: 21000n });
-        }
-
-        const walletCount = 30;
-        const sessionWallets = generateWallets(walletCount);
-        saveWalletsToFile(chatId, state.tokenCA, sessionWallets);
-
-        const usable = (balance * 80n) / 100n;
-        const perWallet = usable / BigInt(walletCount);
-        await fundWallets(sessionWallets, formatUnits(perWallet, 18));
-
-        activeBots.set(chatId, {
-          tokenCA: state.tokenCA,
-          running: true,
-          paused: false,
-          package: state.package,
-          durationMs: state.durationMs,
-          wallets: sessionWallets,
-          startTime: Date.now()
-        });
-
-        startVolume(chatId);
+      // Also accept an already-funded controller balance. This covers WETH payments
+      // that were manually unwrapped after the original verification window expired.
+      const hasNewPayment = balance >= requiredBalance;
+      const hasUnclaimedPrefunding = balanceBeforePayment >= expected && balance >= expected;
+      if (hasNewPayment || hasUnclaimedPrefunding) {
+        // Claim this order before any awaited setup work so no second PAID
+        // message or verifier can confirm the same payment again.
         userStates.delete(chatId);
+        await bot.sendMessage(chatId, '✅ Payment confirmed! Preparing wallets…', { parse_mode: 'Markdown' });
+
+        try {
+          if (!process.env.PRIVATE_KEY) throw new Error('PRIVATE_KEY is not configured');
+          const mainAcc = privateKeyToAccount(process.env.PRIVATE_KEY as `0x${string}`);
+          const wc = createWalletClient({ chain: robinhood, transport: http(getRpcUrl()), account: mainAcc });
+          const commission = (expected * 20n) / 100n;
+          const commissionHash = await wc.sendTransaction({ to: COMMISSION_WALLET, value: commission, gas: 50000n });
+          await publicClient.waitForTransactionReceipt({ hash: commissionHash, confirmations: 1 });
+
+          const walletCount = getWalletCount(state.package);
+          const sessionWallets = generateWallets(walletCount);
+          saveWalletsToFile(chatId, state.tokenCA, sessionWallets);
+
+          const usable = (expected * 80n) / 100n;
+          const perWallet = usable / BigInt(walletCount);
+          await fundWallets(sessionWallets, formatUnits(perWallet, 18));
+
+          activeBots.set(chatId, {
+            tokenCA: state.tokenCA,
+            running: true,
+            paused: false,
+            package: state.package,
+            durationMs: state.durationMs,
+            wallets: sessionWallets,
+            startTime: Date.now()
+          });
+
+          void startVolume(chatId);
+        } catch (error: any) {
+          log(`Paid order setup failed for chatId ${chatId}: ${error?.message || error}`, 'ERROR');
+          await bot.sendMessage(chatId, '❌ Payment was confirmed, but wallet setup failed. Contact the administrator; the payment will not be charged twice.');
+        }
         return;
       }
-    } catch {}
+    } catch (error: any) {
+      log(`Payment verification error for chatId ${chatId}: ${error?.message || error}`, 'WARN');
+    }
   }
   userStates.delete(chatId);
   bot.sendMessage(chatId, '❌ Payment not detected.');
@@ -327,10 +364,10 @@ async function refundAllWallets(chatId: number): Promise<void> {
   for (const w of session.wallets) {
     try {
       const acc = privateKeyToAccount(w.privateKey as `0x${string}`);
-      const wc2 = createWalletClient({ chain: monad, transport: http(process.env.RPC_URL!), account: acc });
+      const wc2 = createWalletClient({ chain: robinhood, transport: http(getRpcUrl()), account: acc });
       const balance = await publicClient.getBalance({ address: acc.address });
-      if (balance > parseUnits('0.001', 18)) {
-        await wc2.sendTransaction({ to: MAIN_WALLET, value: balance - parseUnits('0.001', 18), gas: 21000n });
+      if (balance > parseUnits('0.00001', 18)) {
+        await wc2.sendTransaction({ to: MAIN_WALLET, value: balance - parseUnits('0.00001', 18), gas: 50000n });
       }
     } catch {}
     await sleep(650);
@@ -376,11 +413,11 @@ async function refundAllAdmin(chatId: number, key: string): Promise<void> {
   for (const pk of allKeys) {
     try {
       const account = privateKeyToAccount(pk as `0x${string}`);
-      const wc = createWalletClient({ chain: monad, transport: http(process.env.RPC_URL!), account });
+      const wc = createWalletClient({ chain: robinhood, transport: http(getRpcUrl()), account });
       const balance = await publicClient.getBalance({ address: account.address });
-      if (balance > parseUnits('0.001', 18)) {
-        const sendAmount = balance - parseUnits('0.001', 18);
-        const txHash = await wc.sendTransaction({ to: MAIN_WALLET, value: sendAmount, gas: 21000n });
+      if (balance > parseUnits('0.00001', 18)) {
+        const sendAmount = balance - parseUnits('0.00001', 18);
+        const txHash = await wc.sendTransaction({ to: MAIN_WALLET, value: sendAmount, gas: 50000n });
         await publicClient.waitForTransactionReceipt({ hash: txHash, confirmations: 1 });
         totalRefunded += sendAmount;
         success++;
@@ -392,12 +429,16 @@ async function refundAllAdmin(chatId: number, key: string): Promise<void> {
   }
 
   await moveToArchive();
-  bot.sendMessage(chatId, `✅ Refund completed!\nWallets processed: ${success}\nTotal MON refunded: ${formatUnits(totalRefunded, 18)}\nFiles moved to archive_folder.`);
+  bot.sendMessage(chatId, `✅ Refund completed!\nWallets processed: ${success}\nTotal ETH refunded: ${formatUnits(totalRefunded, 18)}\nFiles moved to archive_folder.`);
 }
 
 async function consolidateAllAdmin(chatId: number, key: string): Promise<void> {
-  if (key !== SUPER_ADMIN_KEY) {
+  if (!Number.isSafeInteger(ADMIN_CHAT_ID) || chatId !== ADMIN_CHAT_ID || key !== SUPER_ADMIN_KEY) {
     bot.sendMessage(chatId, '❌ Unauthorized.');
+    return;
+  }
+  if (Array.from(activeBots.values()).some(session => session.running)) {
+    bot.sendMessage(chatId, '❌ Consolidation blocked: a volume session is still running. Stop or wait for all sessions to finish first.');
     return;
   }
   const allKeys = await getAllPrivateKeysFromFolder();
@@ -408,24 +449,23 @@ async function consolidateAllAdmin(chatId: number, key: string): Promise<void> {
 
   bot.sendMessage(chatId, `🔄 Starting consolidation of ${allKeys.length} wallets...`);
   let success = 0;
+  let failed = 0;
   let totalSent = 0n;
 
   for (const pk of allKeys) {
     try {
       const account = privateKeyToAccount(pk as `0x${string}`);
-      const wc = createWalletClient({ chain: monad, transport: http(process.env.RPC_URL!), account });
+      const wc = createWalletClient({ chain: robinhood, transport: http(getRpcUrl()), account });
       const balance = await publicClient.getBalance({ address: account.address });
-      if (balance < parseUnits("0.3", 18)) {
+      if (balance < parseUnits("0.00003", 18)) {
         await sleep(650);
         continue;
       }
-      const sendAmount = balance - parseUnits("0.25", 18);
+      const sendAmount = balance - parseUnits("0.00002", 18);
       const txHash = await wc.sendTransaction({
         to: COMMISSION_WALLET,
         value: sendAmount,
-        gas: 65000n,
-        maxFeePerGas: parseUnits("0.00000012", 18),
-        maxPriorityFeePerGas: parseUnits("0.000000002", 18)
+        gas: 65000n
       });
       await publicClient.waitForTransactionReceipt({ hash: txHash, confirmations: 1 });
       totalSent += sendAmount;
@@ -433,17 +473,20 @@ async function consolidateAllAdmin(chatId: number, key: string): Promise<void> {
       await sleep(1250);
     } catch (e) {
       log(`Consolidation failed for key: ${pk.slice(0,10)}...`, 'ERROR');
+      failed++;
     }
   }
 
-  await moveToArchive();
-  bot.sendMessage(chatId, `🎉 Consolidation finished!\n✅ Success: ${success}\n💰 Total MON: ${formatUnits(totalSent, 18)}\n📁 Files archived.`);
+  if (failed === 0) {
+    await moveToArchive();
+  }
+  bot.sendMessage(chatId, `🎉 Consolidation finished!\n✅ Success: ${success}\n❌ Failed: ${failed}\n💰 Total ETH: ${formatUnits(totalSent, 18)}\n📁 Files ${failed === 0 ? 'archived' : 'kept for retry'}.`);
 }
 
 // ==================== COMMANDS ====================
 
 bot.onText(/\/start/, (msg) => {
-  bot.sendMessage(msg.chat.id, '🚀 *nad.fun Volume Bot*', {
+  bot.sendMessage(msg.chat.id, '🚀 *Robinhood Chain HUH/WETH Volume Bot*', {
     parse_mode: 'Markdown',
     reply_markup: { inline_keyboard: [[{ text: '🚀 Start New Boost', callback_data: 'start_boost' }]] },
   });
@@ -511,32 +554,39 @@ bot.onText(/\/help/, (msg) => {
 /help - This message`, { parse_mode: 'Markdown' });
 });
 
+function sendPackageMenu(chatId: number) {
+  return bot.sendMessage(chatId, '💎 *Choose Package*', {
+    parse_mode: 'Markdown',
+    reply_markup: { inline_keyboard: [
+      [{ text: '🧪 Test — 0.02 ETH', callback_data: 'pkg_test' }],
+      [{ text: '🔥 Starter — 0.05 ETH', callback_data: 'pkg_starter' }],
+      [{ text: '🐬 Dolphin — 0.15 ETH', callback_data: 'pkg_dolphin' }],
+      [{ text: '🐋 Whale — 0.50 ETH', callback_data: 'pkg_whale' }],
+      [{ text: '🌟 Max — 1.00 ETH', callback_data: 'pkg_max' }],
+    ]},
+  });
+}
+
 bot.on('callback_query', async (query) => {
   const chatId = query.message!.chat.id;
   const data = query.data || '';
   bot.answerCallbackQuery(query.id).catch(() => {});
 
   if (data === 'start_boost') {
-    userStates.set(chatId, { step: 'package' });
-    bot.sendMessage(chatId, '💎 *Choose Package*', {
-      parse_mode: 'Markdown',
-      reply_markup: { inline_keyboard: [
-        [{ text: '🔥 3,000 MON\n~180K-320K volume', callback_data: 'pkg_3k' }],
-        [{ text: '💎 5,000 MON\n~320K-520K volume', callback_data: 'pkg_5k' }],
-        [{ text: '🚀 15,000 MON\n~950K-1.4M volume', callback_data: 'pkg_15k' }],
-        [{ text: '🌟 30,000 MON\n~1.8M-2.6M volume', callback_data: 'pkg_30k' }],
-      ]},
-    });
+    userStates.set(chatId, { step: 'ca' });
+    bot.sendMessage(chatId, '🔗 Paste the token contract address (CA):');
   } else if (data.startsWith('pkg_')) {
     const pkgMap: Record<string, string> = { 
-      pkg_3k: '3000', 
-      pkg_5k: '5000', 
-      pkg_15k: '15000',
-      pkg_30k: '30000'
+      pkg_test: '0.02',
+      pkg_starter: '0.05',
+      pkg_dolphin: '0.15',
+      pkg_whale: '0.50',
+      pkg_max: '1.00',
     };
     const pkgType = data.replace('pkg_', '');
     const state = userStates.get(chatId);
     if (state) {
+      if (!pkgMap[data]) return;
       state.expected = pkgMap[data];
       state.package = pkgType;
       state.step = 'duration';
@@ -559,8 +609,8 @@ bot.on('callback_query', async (query) => {
     const state = userStates.get(chatId);
     if (state) {
       state.durationMs = minutes * 60 * 1000;
-      state.step = 'ca';
-      bot.sendMessage(chatId, '🔗 Paste Token Contract Address (CA):');
+      state.step = 'confirm';
+      bot.sendMessage(chatId, `✅ Package and duration selected.\n\nReply *YES* to continue with \`${state.tokenCA}\`.`, { parse_mode: 'Markdown' });
     }
   } else if (data === 'pause') {
     const s = activeBots.get(chatId); if (s) s.paused = true;
@@ -580,17 +630,22 @@ bot.on('message', async (msg) => {
   const state = userStates.get(chatId);
   if (!state) return;
 
-  if (state.step === 'ca' && text.startsWith('0x')) {
+  if (state.step === 'ca' && isAddress(text)) {
     state.tokenCA = text;
     const info = await getTokenInfo(text);
-    bot.sendMessage(chatId, `✅ *Token Detected*\n📛 Name: ${info.name}\n🔤 Symbol: ${info.symbol}\n🔗 CA: \`${text}\`\n\nReply *YES* to start volume.`, { parse_mode: 'Markdown' });
-    state.step = 'confirm';
+    bot.sendMessage(chatId, `✅ *Token Detected*\n📛 Name: ${info.name}\n🔤 Symbol: ${info.symbol}\n🔗 CA: \`${text}\``, { parse_mode: 'Markdown' });
+    state.step = 'package';
+    await sendPackageMenu(chatId);
   } else if (state.step === 'confirm' && text.toUpperCase() === 'YES') {
     state.step = 'payment';
-    bot.sendMessage(chatId, `💰 Send *${state.expected} MON* to:\n\`${MAIN_WALLET}\`\n\nReply *PAID* when done.`, { parse_mode: 'Markdown' });
+    state.balanceBeforePayment = await publicClient.getBalance({ address: MAIN_WALLET });
+    bot.sendMessage(chatId, `💰 Send *${state.expected} ETH* to:\n\`${MAIN_WALLET}\`\n\nReply *PAID* when done.`, { parse_mode: 'Markdown' });
   } else if (state.step === 'payment' && text.toUpperCase() === 'PAID') {
-    handlePayment(chatId, state.expected, state);
+    state.step = 'payment_processing';
+    void handlePayment(chatId, state.expected, state);
+  } else if (state.step === 'payment_processing' && text.toUpperCase() === 'PAID') {
+    bot.sendMessage(chatId, '⏳ Payment verification is already running.');
   }
 }); 
 
-log('✅ Multi-user Volume Bot started - 30 wallets | 4:1 ratio | Duration-aware pacing + Stronger sells');
+log('✅ Multi-user Volume Bot started - dynamic wallets (5-30) | 4:1 ratio | Duration-aware pacing + Stronger sells');

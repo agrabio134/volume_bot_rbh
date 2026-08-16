@@ -1,14 +1,23 @@
 {
-  "name": "monad-volume-bot",
+  "name": "robinhood-chain-volume-bot",
   "version": "1.0.0",
   "description": "",
   "main": "index.js",
   "scripts": {
+    "build": "tsc",
+    "start": "node dist/start-all.js",
+    "start:all": "ts-node start-all.ts",
+    "start:volume": "ts-node bot.ts",
+    "start:buybot": "ts-node buybot.ts",
+    "typecheck": "tsc --noEmit",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
+  "engines": {
+    "node": ">=20 <25"
+  },
   "type": "commonjs",
   "dependencies": {
     "dotenv": "^17.4.2",

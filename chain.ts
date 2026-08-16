@@ -1,0 +1,21 @@
+export const robinhood = {
+  id: 4663,
+  name: 'Robinhood Chain',
+  nativeCurrency: { name: 'Ether', symbol: 'ETH', decimals: 18 },
+  rpcUrls: { default: { http: ['http://localhost:8545'] } },
+} as const;
+
+export const HUH_TOKEN = '0xbb067737314e04b350c1d35e4784bcbc98405855' as const;
+export const WETH_TOKEN = '0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73' as const;
+export const HUH_WETH_POOL = '0xAB47f8FB0b6BD56F5B65cC2578f4329CE68547Ca' as const;
+export const POOL_FEE = 10_000;
+export const SWAP_ROUTER = '0xcaf681a66d020601342297493863e78c959e5cb2' as const;
+export const QUOTER_V2 = '0x33e885ed0ec9bf04ecfb19341582aadcb4c8a9e7' as const;
+export const COMMISSION_WALLET = '0x1490bB810798db9cD977B7737cC8bEaB5C922e35' as const;
+export const CONTROLLER_WALLET = '0x11DC9eB9004e4F0253FCD3Bd660350FE93cDcEC1' as const;
+
+export function getRpcUrl(): string {
+  const rpcUrl = process.env.RPC_URL;
+  if (!rpcUrl) throw new Error('RPC_URL is required for Robinhood Chain (chain ID 4663)');
+  return rpcUrl;
+}

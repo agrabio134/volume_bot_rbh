@@ -1,6 +1,9 @@
 node_modules
+dist/
 .env
 privekey.txt
 trash.txt
 private_folder/
-archive_folder/ 
+archive_folder/
+buybot-state.json
+data/
