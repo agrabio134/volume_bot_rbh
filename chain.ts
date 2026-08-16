@@ -1,3 +1,5 @@
+import { fallback, http } from 'viem';
+
 export const robinhood = {
   id: 4663,
   name: 'Robinhood Chain',
@@ -18,4 +20,18 @@ export function getRpcUrl(): string {
   const rpcUrl = process.env.RPC_URL;
   if (!rpcUrl) throw new Error('RPC_URL is required for Robinhood Chain (chain ID 4663)');
   return rpcUrl;
+}
+
+export function getRpcUrls(): string[] {
+  const configured = [process.env.RPC_URL, process.env.RPC_URL_BACKUP, ...(process.env.RPC_URLS || '').split(',')]
+    .map(value => value?.trim())
+    .filter((value): value is string => Boolean(value));
+  const unique = [...new Set(configured)];
+  if (!unique.length) throw new Error('RPC_URL is required for Robinhood Chain (chain ID 4663)');
+  return unique;
+}
+
+export function getRpcTransport() {
+  const transports = getRpcUrls().map(url => http(url, { timeout: 12_000, retryCount: 2 }));
+  return transports.length === 1 ? transports[0] : fallback(transports, { rank: true, retryCount: 1 });
 }

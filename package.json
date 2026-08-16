@@ -10,7 +10,7 @@
     "start:volume": "ts-node bot.ts",
     "start:buybot": "ts-node buybot.ts",
     "typecheck": "tsc --noEmit",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "npm run typecheck && ts-node platform-state.test.ts"
   },
   "keywords": [],
   "author": "",
@@ -21,12 +21,11 @@
   "type": "commonjs",
   "dependencies": {
     "dotenv": "^17.4.2",
-    "node-telegram-bot-api": "^0.67.0",
-    "viem": "^2.21.0"
+    "node-telegram-bot-api": "^1.2.0",
+    "viem": "^2.55.16"
   },
   "devDependencies": {
     "@types/node": "^25.9.1",
-    "@types/node-telegram-bot-api": "^0.64.14",
     "ts-node": "^10.9.2",
     "typescript": "^6.0.3"
   }

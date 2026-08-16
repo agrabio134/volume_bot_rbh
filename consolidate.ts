@@ -1,14 +1,14 @@
-import { createPublicClient, createWalletClient, http, parseUnits, formatUnits } from 'viem';
+import { createPublicClient, createWalletClient, parseUnits, formatUnits } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as dotenv from 'dotenv';
-import { robinhood, CONTROLLER_WALLET, getRpcUrl } from './chain';
+import { robinhood, CONTROLLER_WALLET, getRpcTransport } from './chain';
 dotenv.config();
 
 const publicClient = createPublicClient({ 
   chain: robinhood,
-  transport: http(getRpcUrl())
+  transport: getRpcTransport()
 });
 
 const TARGET_WALLET = CONTROLLER_WALLET;
@@ -39,7 +39,7 @@ async function main() {
       const account = privateKeyToAccount(pk);
       const walletClient = createWalletClient({ 
         chain: robinhood,
-        transport: http(getRpcUrl()),
+        transport: getRpcTransport(),
         account 
       });
 

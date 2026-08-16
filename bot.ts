@@ -1,7 +1,6 @@
 import {
   createPublicClient,
   createWalletClient,
-  http,
   parseUnits,
   formatUnits,
   encodeFunctionData,
@@ -9,15 +8,19 @@ import {
   isAddress,
 } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
-import TelegramBot from 'node-telegram-bot-api';
+import TelegramBot, { type Message } from 'node-telegram-bot-api';
 import * as dotenv from 'dotenv';
 import * as fs from 'fs';
 import * as path from 'path';
 import crypto from 'crypto';
 import {
   robinhood, HUH_TOKEN, WETH_TOKEN, HUH_WETH_POOL, POOL_FEE, SWAP_ROUTER,
-  QUOTER_V2, COMMISSION_WALLET, CONTROLLER_WALLET, getRpcUrl,
+  QUOTER_V2, COMMISSION_WALLET, CONTROLLER_WALLET, getRpcTransport,
 } from './chain';
+import {
+  PlatformStateStore, SlidingWindowRateLimiter, decryptWalletKeys, defaultUserPreference,
+  encryptWalletKeys, makeId, type PaymentOrder, type PersistedSession,
+} from './platform-state';
 
 dotenv.config();
 
@@ -28,6 +31,9 @@ const ADMIN_CHAT_ID = Number(process.env.ADMIN_CHAT_ID);
 const DATA_FOLDER = process.env.DATA_DIR || process.cwd();
 const PRIVATE_FOLDER = path.join(DATA_FOLDER, 'private_folder');
 const ARCHIVE_FOLDER = path.join(DATA_FOLDER, 'archive_folder');
+const platformStore = new PlatformStateStore(DATA_FOLDER);
+const platform = platformStore.get();
+const rateLimiter = new SlidingWindowRateLimiter();
 
 fs.mkdirSync(PRIVATE_FOLDER, { recursive: true });
 fs.mkdirSync(ARCHIVE_FOLDER, { recursive: true });
@@ -35,24 +41,34 @@ fs.mkdirSync(ARCHIVE_FOLDER, { recursive: true });
 const bot = new TelegramBot(process.env.BOT_TOKEN!, { polling: true });
 const publicClient = createPublicClient({
   chain: robinhood,
-  transport: http(getRpcUrl()),
+  transport: getRpcTransport(),
 });
 
 type BotMode = 'volume' | 'bump';
 
-type ActiveSession = {
-  tokenCA: string;
-  running: boolean;
-  paused: boolean;
-  package: string;
-  mode: BotMode;
-  durationMs: number;
-  wallets: { privateKey: string }[];
-  startTime: number;
-};
+type ActiveSession = PersistedSession;
 
 const userStates = new Map<number, any>();
-const activeBots = new Map<number, ActiveSession>();
+const activeBots = new Map<number, ActiveSession>(
+  Object.entries(platform.sessions)
+    .filter(([, session]) => session.setupStatus === 'funding' || (session.running && session.endTime > Date.now()))
+    .map(([chatId, session]) => [Number(chatId), session]),
+);
+
+function savePlatformState(): void {
+  platform.sessions = Object.fromEntries(Array.from(activeBots.entries()).map(([chatId, session]) => [String(chatId), session]));
+  platformStore.save();
+}
+
+function currentUser(chatId: number) {
+  const key = String(chatId);
+  platform.users[key] ??= defaultUserPreference();
+  return platform.users[key];
+}
+
+function orderById(orderId?: string): PaymentOrder | undefined {
+  return orderId ? platform.orders.find(order => order.id === orderId) : undefined;
+}
 
 const ERC20_ABI = [
   { name: 'balanceOf', type: 'function', inputs: [{ name: 'account', type: 'address' }], outputs: [{ type: 'uint256' }] },
@@ -102,12 +118,88 @@ const QUOTER_ABI = [{
   outputs: [{ name: 'amountOut', type: 'uint256' }, { name: 'sqrtPriceX96After', type: 'uint160' }, { name: 'initializedTicksCrossed', type: 'uint32' }, { name: 'gasEstimate', type: 'uint256' }],
 }] as const;
 
-async function quoteMinimum(tokenIn: `0x${string}`, tokenOut: `0x${string}`, amountIn: bigint) {
+const POOL_READ_ABI = [
+  { name: 'token0', type: 'function', stateMutability: 'view', inputs: [], outputs: [{ type: 'address' }] },
+  { name: 'token1', type: 'function', stateMutability: 'view', inputs: [], outputs: [{ type: 'address' }] },
+  { name: 'fee', type: 'function', stateMutability: 'view', inputs: [], outputs: [{ type: 'uint24' }] },
+] as const;
+
+type PoolDiscovery = { poolAddress: `0x${string}`; poolFee: number; liquidityUsd?: number; dexUrl?: string; roundTripBps?: number };
+
+async function discoverPool(tokenCA: string): Promise<PoolDiscovery> {
+  const normalizedToken = tokenCA.toLowerCase();
+  const pairsResponse = await fetch(`https://api.dexscreener.com/token-pairs/v1/robinhood/${tokenCA}`, {
+    signal: AbortSignal.timeout(6_000),
+  });
+  if (!pairsResponse.ok) throw new Error(`DEX Screener returned HTTP ${pairsResponse.status}`);
+  const pairs = await pairsResponse.json() as Array<{
+    pairAddress?: string;
+    baseToken?: { address?: string };
+    quoteToken?: { address?: string };
+    liquidity?: { usd?: number };
+    url?: string;
+  }>;
+  const candidates = pairs
+    .filter(pair => pair.pairAddress && isAddress(pair.pairAddress))
+    .filter(pair => {
+      const addresses = [pair.baseToken?.address?.toLowerCase(), pair.quoteToken?.address?.toLowerCase()];
+      return addresses.includes(normalizedToken) && addresses.includes(WETH_TOKEN.toLowerCase());
+    })
+    .sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0));
+  if (!candidates.length) throw new Error('No WETH pool was found for this token on Robinhood Chain');
+
+  for (const candidate of candidates) {
+    try {
+      const poolAddress = candidate.pairAddress as `0x${string}`;
+      const [token0, token1, fee] = await Promise.all([
+        publicClient.readContract({ address: poolAddress, abi: POOL_READ_ABI, functionName: 'token0' }),
+        publicClient.readContract({ address: poolAddress, abi: POOL_READ_ABI, functionName: 'token1' }),
+        publicClient.readContract({ address: poolAddress, abi: POOL_READ_ABI, functionName: 'fee' }),
+      ]);
+      const actualTokens = [token0.toLowerCase(), token1.toLowerCase()];
+      if (!actualTokens.includes(normalizedToken) || !actualTokens.includes(WETH_TOKEN.toLowerCase())) continue;
+      return { poolAddress, poolFee: Number(fee), liquidityUsd: candidate.liquidity?.usd, dexUrl: candidate.url };
+    } catch {
+      continue;
+    }
+  }
+  throw new Error('The discovered pair is not a compatible Uniswap V3 WETH pool');
+}
+
+async function validateTokenAndPool(tokenCA: string): Promise<PoolDiscovery> {
+  const bytecode = await publicClient.getBytecode({ address: tokenCA as `0x${string}` });
+  if (!bytecode || bytecode === '0x') throw new Error('That address is not a token contract');
+  const pool = tokenCA.toLowerCase() === HUH_TOKEN.toLowerCase()
+    ? { poolAddress: HUH_WETH_POOL, poolFee: POOL_FEE }
+    : await discoverPool(tokenCA);
+  const minimumLiquidityUsd = Number(process.env.MIN_POOL_LIQUIDITY_USD || '1000');
+  if (pool.liquidityUsd !== undefined && pool.liquidityUsd < minimumLiquidityUsd) {
+    throw new Error(`Pool liquidity is below the $${minimumLiquidityUsd.toLocaleString()} safety minimum`);
+  }
+  const sampleIn = parseUnits(process.env.SAFETY_QUOTE_ETH || '0.0001', 18);
+  const tokenOut = await quoteRaw(WETH_TOKEN, tokenCA as `0x${string}`, sampleIn, pool.poolFee);
+  if (tokenOut <= 0n) throw new Error('Buy quote returned zero');
+  const wethBack = await quoteRaw(tokenCA as `0x${string}`, WETH_TOKEN, tokenOut, pool.poolFee);
+  const roundTripBps = Number((wethBack * 10_000n) / sampleIn);
+  const minimumRoundTripBps = Number(process.env.MIN_ROUND_TRIP_BPS || '5000');
+  if (roundTripBps < minimumRoundTripBps) {
+    throw new Error(`Round-trip quote retained only ${(roundTripBps / 100).toFixed(2)}%; trading blocked`);
+  }
+  return { ...pool, roundTripBps };
+}
+
+async function quoteRaw(tokenIn: `0x${string}`, tokenOut: `0x${string}`, amountIn: bigint, fee: number): Promise<bigint> {
   const { result } = await publicClient.simulateContract({
     address: QUOTER_V2, abi: QUOTER_ABI, functionName: 'quoteExactInputSingle',
-    args: [{ tokenIn, tokenOut, amountIn, fee: POOL_FEE, sqrtPriceLimitX96: 0n }],
+    args: [{ tokenIn, tokenOut, amountIn, fee, sqrtPriceLimitX96: 0n }],
   });
-  return (result[0] * 97n) / 100n;
+  return result[0];
+}
+
+async function quoteMinimum(tokenIn: `0x${string}`, tokenOut: `0x${string}`, amountIn: bigint, fee: number) {
+  const quoted = await quoteRaw(tokenIn, tokenOut, amountIn, fee);
+  const slippageBps = BigInt(Math.max(1, Math.min(1_500, Number(process.env.MAX_SLIPPAGE_BPS || '300'))));
+  return (quoted * (10_000n - slippageBps)) / 10_000n;
 }
 
 function log(message: string, level: 'INFO' | 'WARN' | 'ERROR' = 'INFO') {
@@ -131,13 +223,19 @@ async function getTokenInfo(tokenCA: string) {
   }
 }
 
-async function executeSwap(walletPk: string, tokenCA: string, isBuy: boolean, packageType: string, durationMs: number, mode: BotMode): Promise<void> {
+async function executeSwap(walletPk: string, session: ActiveSession, isBuy: boolean): Promise<bigint> {
+  const { tokenCA, durationMs, mode } = session;
   const account = privateKeyToAccount(walletPk as `0x${string}`);
-  const walletClient = createWalletClient({ chain: robinhood, transport: http(getRpcUrl()), account });
+  const walletClient = createWalletClient({ chain: robinhood, transport: getRpcTransport(), account });
   const tokenInfo = await getTokenInfo(tokenCA);
   const router = SWAP_ROUTER;
 
   const nativeBalance = await publicClient.getBalance({ address: account.address });
+  const maximumGasGwei = Number(process.env.MAX_GAS_PRICE_GWEI || '0');
+  if (maximumGasGwei > 0) {
+    const gasPrice = await publicClient.getGasPrice();
+    if (gasPrice > parseUnits(String(maximumGasGwei), 9)) throw new Error('Gas price is above the configured safety limit');
+  }
 
   if (isBuy) {
     // Scale each trade to the wallet balance so every package uses safe, proportional sizing.
@@ -146,20 +244,30 @@ async function executeSwap(walletPk: string, tokenCA: string, isBuy: boolean, pa
     const tradeBps = BigInt(Math.floor(baseBps * aggression));
     const rawAmountIn = (nativeBalance * tradeBps) / 10000n;
 
+    if (!session.dailyWindowStartedAt || Date.now() - session.dailyWindowStartedAt >= 24 * 60 * 60 * 1000) {
+      session.dailyWindowStartedAt = Date.now();
+      session.dailyBuyWei = '0';
+    }
+    const dailyLimit = parseUnits(process.env.MAX_SESSION_DAILY_BUY_ETH || '0', 18);
+    const spentToday = BigInt(session.dailyBuyWei || '0');
+    if (dailyLimit > 0n && spentToday + rawAmountIn > dailyLimit) throw new Error('Session daily buy limit reached');
+
     if (nativeBalance < rawAmountIn + parseUnits('0.00002', 18)) throw new Error('Insufficient ETH for buy and gas');
 
-    const amountOutMinimum = await quoteMinimum(WETH_TOKEN, HUH_TOKEN, rawAmountIn);
+    const amountOutMinimum = await quoteMinimum(WETH_TOKEN, tokenCA as `0x${string}`, rawAmountIn, session.poolFee || POOL_FEE);
 
     const data = encodeFunctionData({
       abi: ROUTER_ABI,
       functionName: 'exactInputSingle',
-      args: [{ tokenIn: WETH_TOKEN, tokenOut: HUH_TOKEN, fee: POOL_FEE, recipient: account.address, amountIn: rawAmountIn, amountOutMinimum, sqrtPriceLimitX96: 0n }],
+      args: [{ tokenIn: WETH_TOKEN, tokenOut: tokenCA as `0x${string}`, fee: session.poolFee || POOL_FEE, recipient: account.address, amountIn: rawAmountIn, amountOutMinimum, sqrtPriceLimitX96: 0n }],
     });
 
     const txHash = await walletClient.sendTransaction({ 
       to: router, data, value: rawAmountIn, gas: 950000n 
     });
     await publicClient.waitForTransactionReceipt({ hash: txHash, confirmations: 1 });
+    session.dailyBuyWei = (spentToday + rawAmountIn).toString();
+    return rawAmountIn;
   } else {
     let tokenBalance = 0n;
     for (let i = 0; i < 12; i++) {
@@ -199,11 +307,11 @@ async function executeSwap(walletPk: string, tokenCA: string, isBuy: boolean, pa
       await sleep(1350);
     }
 
-    const amountOutMinimum = await quoteMinimum(HUH_TOKEN, WETH_TOKEN, rawAmountIn);
+    const amountOutMinimum = await quoteMinimum(tokenCA as `0x${string}`, WETH_TOKEN, rawAmountIn, session.poolFee || POOL_FEE);
     const swapData = encodeFunctionData({
       abi: ROUTER_ABI,
       functionName: 'exactInputSingle',
-      args: [{ tokenIn: HUH_TOKEN, tokenOut: WETH_TOKEN, fee: POOL_FEE, recipient: router, amountIn: rawAmountIn, amountOutMinimum, sqrtPriceLimitX96: 0n }],
+      args: [{ tokenIn: tokenCA as `0x${string}`, tokenOut: WETH_TOKEN, fee: session.poolFee || POOL_FEE, recipient: router, amountIn: rawAmountIn, amountOutMinimum, sqrtPriceLimitX96: 0n }],
     });
     const unwrapData = encodeFunctionData({ abi: ROUTER_ABI, functionName: 'unwrapWETH9', args: [amountOutMinimum, account.address] });
     const data = encodeFunctionData({ abi: ROUTER_ABI, functionName: 'multicall', args: [[swapData, unwrapData]] });
@@ -212,6 +320,7 @@ async function executeSwap(walletPk: string, tokenCA: string, isBuy: boolean, pa
       to: router, data, value: 0n, gas: 950000n 
     });
     await publicClient.waitForTransactionReceipt({ hash: txHash, confirmations: 1 });
+    return 0n;
   }
 }
 
@@ -222,14 +331,16 @@ function chooseBuyCount(): number {
   return 3;
 }
 
-async function startVolume(chatId: number): Promise<void> {
+async function startVolume(chatId: number, resumed = false): Promise<void> {
   const session = activeBots.get(chatId)!;
-  const endTime = Date.now() + session.durationMs;
+  const endTime = session.endTime || (session.startTime + session.durationMs);
+  session.endTime = endTime;
   const tokenInfo = await getTokenInfo(session.tokenCA);
   const modeLabel = session.mode === 'bump' ? 'Random Bump Mode' : 'Volume Mode';
   const ratioLabel = 'Random 1:1 / 2:1 / 3:1 (2:1 most common)';
 
-  bot.sendMessage(chatId, `🚀 *Bot Started*\n\n⚙️ Mode: ${modeLabel}\n📛 Token: ${tokenInfo.name} (${tokenInfo.symbol})\n🔗 CA: \`${session.tokenCA}\`\n💎 Package: ${session.package}\n⚖️ Ratio: ${ratioLabel}\n⏱ Duration: ${Math.floor(session.durationMs/3600000)}h ${Math.floor((session.durationMs%3600000)/60000)}m\n👥 Wallets: ${session.wallets.length}`, { parse_mode: 'Markdown' });
+  bot.sendMessage(chatId, `${resumed ? '♻️ *Session Resumed After Restart*' : '🚀 *Bot Started*'}\n\n⚙️ Mode: ${modeLabel}\n📛 Token: ${tokenInfo.name} (${tokenInfo.symbol})\n🔗 CA: \`${session.tokenCA}\`\n💎 Package: ${session.package}\n⚖️ Ratio: ${ratioLabel}\n⏱ Remaining: ${Math.max(0, Math.ceil((endTime - Date.now()) / 60000))} min\n👥 Wallets: ${session.wallets.length}`, { parse_mode: 'Markdown' }).catch(() => {});
+  savePlatformState();
 
   // Dynamic base delay based on total duration
   const baseCycleDelay = Math.max(4500, Math.floor(session.durationMs / 180)); // Longer duration = slower cycles
@@ -244,13 +355,27 @@ async function startVolume(chatId: number): Promise<void> {
       try {
         const buyCount = chooseBuyCount();
         for (let i = 0; i < buyCount; i++) {
-          await executeSwap(w.privateKey, session.tokenCA, true, session.package, session.durationMs, session.mode);
+          await executeSwap(w.privateKey, session, true);
+          session.completedBuys++;
+          session.lastActivityAt = Date.now();
+          savePlatformState();
           await sleep(session.mode === 'bump' ? jitter(2400, 4800) : jitter(1350, 1850));
         }
-        await executeSwap(w.privateKey, session.tokenCA, false, session.package, session.durationMs, session.mode);
+        await executeSwap(w.privateKey, session, false);
+        session.completedSells++;
+        session.lastActivityAt = Date.now();
+        savePlatformState();
         await sleep(session.mode === 'bump' ? jitter(3800, 6200) : jitter(2100, 2800));
       } catch (e: any) {
-        log(`Swap error chatId ${chatId}: ${e.message}`, 'ERROR');
+        session.failedSwaps++;
+        session.lastActivityAt = Date.now();
+        const reason = e?.message || String(e);
+        if (/Insufficient ETH|daily buy limit/i.test(reason)) {
+          session.running = false;
+          bot.sendMessage(chatId, `🛑 Session stopped by a safety rule: ${reason}`).catch(() => {});
+        }
+        savePlatformState();
+        log(`Swap error chatId ${chatId}: ${reason}`, 'ERROR');
         await sleep(10000);
       }
     }
@@ -261,6 +386,13 @@ async function startVolume(chatId: number): Promise<void> {
   }
 
   session.running = false;
+  const completedOrder = orderById(session.orderId);
+  if (completedOrder) {
+    completedOrder.status = 'completed';
+    completedOrder.completedAt = Date.now();
+  }
+  activeBots.delete(chatId);
+  savePlatformState();
   bot.sendMessage(chatId, '🛑 Volume bot finished.').catch(() => {});
 }
 
@@ -293,56 +425,114 @@ function getWalletCount(packageType: string, mode: BotMode): number {
 
 function saveWalletsToFile(chatId: number, tokenCA: string, wallets: { privateKey: string }[]) {
   const date = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-  const filename = `${date}_${chatId}_${tokenCA.slice(0, 10)}.txt`;
+  const filename = `${date}_${chatId}_${tokenCA.slice(0, 10)}.wallets.enc`;
   const filePath = path.join(PRIVATE_FOLDER, filename);
-  fs.writeFileSync(filePath, wallets.map(w => w.privateKey).join('\n'));
+  fs.writeFileSync(filePath, encryptWalletKeys(wallets.map(w => w.privateKey)), { mode: 0o600 });
   log(`Wallets saved to ${filePath}`);
 }
 
 async function fundWallets(wallets: { privateKey: string }[], amountPerWallet: string): Promise<void> {
-  if (!process.env.PRIVATE_KEY) return;
+  if (!process.env.PRIVATE_KEY) throw new Error('PRIVATE_KEY is not configured');
   const mainAcc = privateKeyToAccount(process.env.PRIVATE_KEY as `0x${string}`);
-  const wc = createWalletClient({ chain: robinhood, transport: http(getRpcUrl()), account: mainAcc });
-  const value = parseUnits(amountPerWallet, 18);
+  const wc = createWalletClient({ chain: robinhood, transport: getRpcTransport(), account: mainAcc });
+  const target = parseUnits(amountPerWallet, 18);
+  const failures: string[] = [];
   for (const w of wallets) {
     try {
       const acc = privateKeyToAccount(w.privateKey as `0x${string}`);
-      const txHash = await wc.sendTransaction({ to: acc.address, value, gas: 50000n });
-      await publicClient.waitForTransactionReceipt({ hash: txHash, confirmations: 1 });
-    } catch (e) {
+      const existing = await publicClient.getBalance({ address: acc.address });
+      if (existing < target) {
+        const txHash = await wc.sendTransaction({ to: acc.address, value: target - existing, gas: 50000n });
+        await publicClient.waitForTransactionReceipt({ hash: txHash, confirmations: 1 });
+      }
+    } catch (e: any) {
+      failures.push(e?.message || String(e));
       log(`Funding failed for wallet: ${e}`, 'WARN');
     }
     await sleep(480);
   }
+  if (failures.length) throw new Error(`Funding incomplete for ${failures.length} wallet(s)`);
+}
+
+async function findPaymentTransaction(order: PaymentOrder): Promise<string | undefined> {
+  const latest = await publicClient.getBlockNumber();
+  const created = BigInt(order.createdBlock);
+  let cursor = order.lastScannedBlock ? BigInt(order.lastScannedBlock) + 1n : created;
+  if (cursor > latest) return undefined;
+  // Bound each poll to avoid overwhelming the RPC during busy periods.
+  const end = cursor + 24n < latest ? cursor + 24n : latest;
+  const expected = BigInt(order.expectedWei);
+  const claimed = new Set(platform.claimedPaymentTxHashes.map(hash => hash.toLowerCase()));
+
+  for (; cursor <= end; cursor++) {
+    const block = await publicClient.getBlock({ blockNumber: cursor, includeTransactions: true });
+    for (const transaction of block.transactions) {
+      if (typeof transaction === 'string') continue;
+      if (!transaction.to || transaction.to.toLowerCase() !== MAIN_WALLET.toLowerCase()) continue;
+      if (transaction.value < expected || claimed.has(transaction.hash.toLowerCase())) continue;
+      const receipt = await publicClient.getTransactionReceipt({ hash: transaction.hash });
+      if (receipt.status === 'success') {
+        order.lastScannedBlock = cursor.toString();
+        savePlatformState();
+        return transaction.hash;
+      }
+    }
+    order.lastScannedBlock = cursor.toString();
+  }
+  savePlatformState();
+  return undefined;
+}
+
+async function completeFundingSession(chatId: number, session: ActiveSession): Promise<void> {
+  const order = orderById(session.orderId);
+  if (!order) throw new Error('Session order was not found');
+  if (!process.env.PRIVATE_KEY) throw new Error('PRIVATE_KEY is not configured');
+  if (!order.commissionTxHash) {
+    const mainAcc = privateKeyToAccount(process.env.PRIVATE_KEY as `0x${string}`);
+    const wc = createWalletClient({ chain: robinhood, transport: getRpcTransport(), account: mainAcc });
+    const commission = (BigInt(order.expectedWei) * 20n) / 100n;
+    const commissionHash = await wc.sendTransaction({ to: COMMISSION_WALLET, value: commission, gas: 50000n });
+    await publicClient.waitForTransactionReceipt({ hash: commissionHash, confirmations: 1 });
+    order.commissionTxHash = commissionHash;
+    savePlatformState();
+  }
+  await fundWallets(session.wallets, formatUnits(BigInt(session.fundingTargetWei || '0'), 18));
+  session.setupStatus = 'ready';
+  session.running = true;
+  session.startTime = Date.now();
+  session.endTime = session.startTime + session.durationMs;
+  session.lastActivityAt = Date.now();
+  order.status = 'running';
+  delete order.failureReason;
+  savePlatformState();
 }
 
 async function handlePayment(chatId: number, expectedAmount: string, state: any): Promise<void> {
   const expected = parseUnits(expectedAmount, 18);
-  const balanceBeforePayment = (state.balanceBeforePayment ?? 0n) as bigint;
-  const requiredBalance = balanceBeforePayment + expected;
+  const order = orderById(state.orderId);
+  if (!order) {
+    userStates.delete(chatId);
+    await bot.sendMessage(chatId, '❌ Payment invoice was not found. Start again with /start.');
+    return;
+  }
+  order.status = 'verifying';
+  savePlatformState();
   bot.sendMessage(chatId, `⏳ Verifying *${expectedAmount} ETH* on \`${MAIN_WALLET}\``, { parse_mode: 'Markdown' });
   for (let i = 0; i < 72; i++) {
     if (i > 0) await sleep(5000);
     try {
-      const balance = await publicClient.getBalance({ address: MAIN_WALLET });
-      // Also accept an already-funded controller balance. This covers WETH payments
-      // that were manually unwrapped after the original verification window expired.
-      const hasNewPayment = balance >= requiredBalance;
-      const hasUnclaimedPrefunding = balanceBeforePayment >= expected && balance >= expected;
-      if (hasNewPayment || hasUnclaimedPrefunding) {
+      const paymentTxHash = await findPaymentTransaction(order);
+      if (paymentTxHash) {
         // Claim this order before any awaited setup work so no second PAID
         // message or verifier can confirm the same payment again.
+        order.status = 'paid';
+        order.paymentTxHash = paymentTxHash;
+        platform.claimedPaymentTxHashes.push(paymentTxHash);
+        savePlatformState();
         userStates.delete(chatId);
-        await bot.sendMessage(chatId, '✅ Payment confirmed! Preparing wallets…', { parse_mode: 'Markdown' });
+        await bot.sendMessage(chatId, `✅ Payment confirmed!\nReceipt: \`${order.id}\`\nPreparing wallets…`, { parse_mode: 'Markdown' });
 
         try {
-          if (!process.env.PRIVATE_KEY) throw new Error('PRIVATE_KEY is not configured');
-          const mainAcc = privateKeyToAccount(process.env.PRIVATE_KEY as `0x${string}`);
-          const wc = createWalletClient({ chain: robinhood, transport: http(getRpcUrl()), account: mainAcc });
-          const commission = (expected * 20n) / 100n;
-          const commissionHash = await wc.sendTransaction({ to: COMMISSION_WALLET, value: commission, gas: 50000n });
-          await publicClient.waitForTransactionReceipt({ hash: commissionHash, confirmations: 1 });
-
           const mode: BotMode = state.mode === 'bump' ? 'bump' : 'volume';
           const walletCount = getWalletCount(state.package, mode);
           const sessionWallets = generateWallets(walletCount);
@@ -350,21 +540,34 @@ async function handlePayment(chatId: number, expectedAmount: string, state: any)
 
           const usable = (expected * 80n) / 100n;
           const perWallet = usable / BigInt(walletCount);
-          await fundWallets(sessionWallets, formatUnits(perWallet, 18));
-
-          activeBots.set(chatId, {
+          const session: ActiveSession = {
             tokenCA: state.tokenCA,
-            running: true,
+            running: false,
             paused: false,
             package: state.package,
             mode,
             durationMs: state.durationMs,
             wallets: sessionWallets,
-            startTime: Date.now()
-          });
-
+            startTime: Date.now(),
+            endTime: Date.now() + state.durationMs,
+            orderId: order.id,
+            poolAddress: state.poolAddress,
+            poolFee: state.poolFee,
+            completedBuys: 0,
+            completedSells: 0,
+            failedSwaps: 0,
+            lastActivityAt: Date.now(),
+            setupStatus: 'funding',
+            fundingTargetWei: perWallet.toString(),
+          };
+          activeBots.set(chatId, session);
+          savePlatformState();
+          await completeFundingSession(chatId, session);
           void startVolume(chatId);
         } catch (error: any) {
+          order.status = activeBots.get(chatId)?.setupStatus === 'funding' ? 'paid' : 'failed';
+          order.failureReason = error?.message || String(error);
+          savePlatformState();
           log(`Paid order setup failed for chatId ${chatId}: ${error?.message || error}`, 'ERROR');
           await bot.sendMessage(chatId, '❌ Payment was confirmed, but wallet setup failed. Contact the administrator; the payment will not be charged twice.');
         }
@@ -375,6 +578,8 @@ async function handlePayment(chatId: number, expectedAmount: string, state: any)
     }
   }
   userStates.delete(chatId);
+  order.status = 'expired';
+  savePlatformState();
   bot.sendMessage(chatId, '❌ Payment not detected.');
 }
 
@@ -389,7 +594,7 @@ async function refundAllWallets(chatId: number): Promise<void> {
   for (const w of session.wallets) {
     try {
       const acc = privateKeyToAccount(w.privateKey as `0x${string}`);
-      const wc2 = createWalletClient({ chain: robinhood, transport: http(getRpcUrl()), account: acc });
+      const wc2 = createWalletClient({ chain: robinhood, transport: getRpcTransport(), account: acc });
       const balance = await publicClient.getBalance({ address: acc.address });
       if (balance > parseUnits('0.00001', 18)) {
         await wc2.sendTransaction({ to: MAIN_WALLET, value: balance - parseUnits('0.00001', 18), gas: 50000n });
@@ -402,18 +607,20 @@ async function refundAllWallets(chatId: number): Promise<void> {
 }
 
 async function getAllPrivateKeysFromFolder(): Promise<string[]> {
-  const files = fs.readdirSync(PRIVATE_FOLDER).filter(f => f.endsWith('.txt'));
+  const files = fs.readdirSync(PRIVATE_FOLDER).filter(f => f.endsWith('.txt') || f.endsWith('.wallets.enc'));
   const allKeys: string[] = [];
   for (const file of files) {
     const content = fs.readFileSync(path.join(PRIVATE_FOLDER, file), 'utf8');
-    const keys = content.split('\n').map(l => l.trim()).filter(l => l && l.startsWith('0x'));
+    const keys = file.endsWith('.wallets.enc')
+      ? decryptWalletKeys(content)
+      : content.split('\n').map(l => l.trim()).filter(l => l && l.startsWith('0x'));
     allKeys.push(...keys);
   }
   return allKeys;
 }
 
 async function moveToArchive(): Promise<void> {
-  const files = fs.readdirSync(PRIVATE_FOLDER).filter(f => f.endsWith('.txt'));
+  const files = fs.readdirSync(PRIVATE_FOLDER).filter(f => f.endsWith('.txt') || f.endsWith('.wallets.enc'));
   for (const file of files) {
     fs.renameSync(path.join(PRIVATE_FOLDER, file), path.join(ARCHIVE_FOLDER, file));
   }
@@ -421,7 +628,7 @@ async function moveToArchive(): Promise<void> {
 }
 
 async function refundAllAdmin(chatId: number, key: string): Promise<void> {
-  if (key !== SUPER_ADMIN_KEY) {
+  if (chatId !== ADMIN_CHAT_ID && key !== SUPER_ADMIN_KEY) {
     bot.sendMessage(chatId, '❌ Unauthorized.');
     return;
   }
@@ -438,7 +645,7 @@ async function refundAllAdmin(chatId: number, key: string): Promise<void> {
   for (const pk of allKeys) {
     try {
       const account = privateKeyToAccount(pk as `0x${string}`);
-      const wc = createWalletClient({ chain: robinhood, transport: http(getRpcUrl()), account });
+      const wc = createWalletClient({ chain: robinhood, transport: getRpcTransport(), account });
       const balance = await publicClient.getBalance({ address: account.address });
       if (balance > parseUnits('0.00001', 18)) {
         const sendAmount = balance - parseUnits('0.00001', 18);
@@ -458,7 +665,7 @@ async function refundAllAdmin(chatId: number, key: string): Promise<void> {
 }
 
 async function consolidateAllAdmin(chatId: number, key: string): Promise<void> {
-  if (!Number.isSafeInteger(ADMIN_CHAT_ID) || chatId !== ADMIN_CHAT_ID || key !== SUPER_ADMIN_KEY) {
+  if (!Number.isSafeInteger(ADMIN_CHAT_ID) || chatId !== ADMIN_CHAT_ID) {
     bot.sendMessage(chatId, '❌ Unauthorized.');
     return;
   }
@@ -480,7 +687,7 @@ async function consolidateAllAdmin(chatId: number, key: string): Promise<void> {
   for (const pk of allKeys) {
     try {
       const account = privateKeyToAccount(pk as `0x${string}`);
-      const wc = createWalletClient({ chain: robinhood, transport: http(getRpcUrl()), account });
+      const wc = createWalletClient({ chain: robinhood, transport: getRpcTransport(), account });
       const balance = await publicClient.getBalance({ address: account.address });
       if (balance < parseUnits("0.00003", 18)) {
         await sleep(650);
@@ -508,16 +715,167 @@ async function consolidateAllAdmin(chatId: number, key: string): Promise<void> {
   bot.sendMessage(chatId, `🎉 Consolidation finished!\n✅ Success: ${success}\n❌ Failed: ${failed}\n💰 Total ETH: ${formatUnits(totalSent, 18)}\n📁 Files ${failed === 0 ? 'archived' : 'kept for retry'}.`);
 }
 
+function isSuperAdminMessage(msg: Message): boolean {
+  if (!Number.isSafeInteger(ADMIN_CHAT_ID)) return false;
+  return msg.chat.id === ADMIN_CHAT_ID || msg.from?.id === ADMIN_CHAT_ID;
+}
+
+function referralCode(chatId: number): string {
+  return `RBH${Math.abs(chatId).toString(36).toUpperCase()}`;
+}
+
+function discountBps(chatId: number): number {
+  const preference = currentUser(chatId);
+  if (preference.promoCode === 'WELCOME5' || preference.referredBy) return 500;
+  return 0;
+}
+
+function sessionLine(session: ActiveSession): string {
+  const remaining = Math.max(0, Math.ceil((session.endTime - Date.now()) / 60_000));
+  return `${session.mode.toUpperCase()} | ${session.package} | ${remaining}m left | ${session.completedBuys} buys | ${session.completedSells} sells | ${session.failedSwaps} errors`;
+}
+
+async function sendHealth(chatId: number): Promise<void> {
+  try {
+    const started = Date.now();
+    const block = await publicClient.getBlockNumber();
+    const latency = Date.now() - started;
+    const running = Array.from(activeBots.values()).filter(session => session.running).length;
+    const lastActivity = Math.max(0, ...Array.from(activeBots.values()).map(session => session.lastActivityAt || 0));
+    await bot.sendMessage(chatId, [
+      '🩺 Bot Health',
+      `RPC: ONLINE (${latency}ms)`,
+      `Latest block: ${block}`,
+      `Active sessions: ${running}`,
+      `Open payments: ${platform.orders.filter(order => ['pending', 'verifying'].includes(order.status)).length}`,
+      `Last trading activity: ${lastActivity ? new Date(lastActivity).toISOString() : 'none'}`,
+      `Persistent storage: encrypted v${platform.version}`,
+    ].join('\n'));
+  } catch (error: any) {
+    await bot.sendMessage(chatId, `⚠️ Health degraded\nRPC: OFFLINE\n${error?.message || error}`);
+  }
+}
+
 // ==================== COMMANDS ====================
 
 bot.onText(/\/start/, (msg) => {
-  bot.sendMessage(msg.chat.id, '🚀 *Robinhood Chain HUH/WETH Trading Bot*', {
+  if (!rateLimiter.allow(msg.from?.id || msg.chat.id)) return void bot.sendMessage(msg.chat.id, 'Please wait a moment before sending more commands.');
+  const preference = currentUser(msg.chat.id);
+  savePlatformState();
+  bot.sendMessage(msg.chat.id, preference.language === 'fil' ? '🚀 *Robinhood Chain Trading Bot*\n\nPumili ng mode:' : '🚀 *Robinhood Chain Trading Bot*\n\nChoose a mode:', {
     parse_mode: 'Markdown',
     reply_markup: { inline_keyboard: [
-      [{ text: '🚀 Start Volume Boost', callback_data: 'start_boost' }],
-      [{ text: '📈 Start Random Bump Mode', callback_data: 'start_bump' }],
+      [{ text: preference.language === 'fil' ? '🚀 Simulan ang Volume' : '🚀 Start Volume Boost', callback_data: 'start_boost' }],
+      [{ text: preference.language === 'fil' ? '📈 Simulan ang Bump Mode' : '📈 Start Random Bump Mode', callback_data: 'start_bump' }],
     ] },
   });
+});
+
+bot.onText(/^\/dashboard(?:@\w+)?$/, (msg) => {
+  const sessions = Array.from(activeBots.values()).filter(session => session.running);
+  const orders = platform.orders.filter(order => order.chatId === msg.chat.id);
+  const latest = orders.slice(-3).reverse();
+  const lines = [
+    '📋 YOUR DASHBOARD',
+    `Active sessions: ${sessions.filter(session => orderById(session.orderId)?.chatId === msg.chat.id).length}`,
+    `Orders: ${orders.length}`,
+    `Referral code: ${referralCode(msg.chat.id)}`,
+    '',
+    ...latest.map(order => `${order.id} | ${order.package} | ${order.status}`),
+  ];
+  bot.sendMessage(msg.chat.id, lines.join('\n'));
+});
+
+bot.onText(/^\/history(?:@\w+)?$/, (msg) => {
+  const orders = platform.orders.filter(order => order.chatId === msg.chat.id).slice(-10).reverse();
+  if (!orders.length) return void bot.sendMessage(msg.chat.id, 'No orders yet.');
+  bot.sendMessage(msg.chat.id, `🧾 Order History\n\n${orders.map(order => `${order.id}\n${order.package} • ${order.mode} • ${order.status}\n${formatUnits(BigInt(order.expectedWei), 18)} ETH`).join('\n\n')}`);
+});
+
+bot.onText(/^\/receipt(?:@\w+)?\s+(\S+)$/, (msg, match) => {
+  const order = platform.orders.find(item => item.id === match?.[1] && (item.chatId === msg.chat.id || isSuperAdminMessage(msg)));
+  if (!order) return void bot.sendMessage(msg.chat.id, 'Receipt not found.');
+  bot.sendMessage(msg.chat.id, [
+    '🧾 PAYMENT RECEIPT',
+    `Order: ${order.id}`,
+    `Package: ${order.package}`,
+    `Mode: ${order.mode}`,
+    `Amount: ${formatUnits(BigInt(order.expectedWei), 18)} ETH`,
+    `Status: ${order.status}`,
+    `Payment tx: ${order.paymentTxHash || 'pending'}`,
+    `Created: ${new Date(order.createdAt).toISOString()}`,
+  ].join('\n'));
+});
+
+bot.onText(/^\/health(?:@\w+)?$/, msg => void sendHealth(msg.chat.id));
+
+bot.onText(/^\/demo(?:@\w+)?(?:\s+(0x[a-fA-F0-9]{40}))?$/, async (msg, match) => {
+  const tokenCA = match?.[1] || HUH_TOKEN;
+  try {
+    const [info, pool] = await Promise.all([getTokenInfo(tokenCA), validateTokenAndPool(tokenCA)]);
+    const sampleIn = parseUnits('0.001', 18);
+    const quoted = await quoteMinimum(WETH_TOKEN, tokenCA as `0x${string}`, sampleIn, pool.poolFee);
+    await bot.sendMessage(msg.chat.id, [
+      '🧪 DEMO QUOTE — no funds moved',
+      `${info.name} (${info.symbol})`,
+      `Input: 0.001 ETH`,
+      `Estimated minimum output: ${formatUnits(quoted, info.decimals)} ${info.symbol}`,
+      `Pool fee: ${pool.poolFee}`,
+      `Liquidity: ${pool.liquidityUsd === undefined ? 'not supplied' : `$${pool.liquidityUsd.toLocaleString()}`}`,
+      'Contract and WETH pool validation: PASSED',
+    ].join('\n'));
+  } catch (error: any) {
+    await bot.sendMessage(msg.chat.id, `❌ Demo validation failed: ${error?.message || error}`);
+  }
+});
+
+bot.onText(/^\/referral(?:@\w+)?$/, msg => {
+  const user = currentUser(msg.chat.id);
+  bot.sendMessage(msg.chat.id, `🎁 Your referral code: ${referralCode(msg.chat.id)}\nSuccessful uses: ${user.referralUses}\nNew users receive 5% off their next package.`);
+});
+
+bot.onText(/^\/promo(?:@\w+)?\s+(\S+)$/, (msg, match) => {
+  const code = (match?.[1] || '').toUpperCase();
+  const preference = currentUser(msg.chat.id);
+  if (code === 'WELCOME5') {
+    preference.promoCode = code;
+  } else if (code.startsWith('RBH')) {
+    const referrer = Object.keys(platform.users).map(Number).find(chatId => referralCode(chatId) === code && chatId !== msg.chat.id);
+    if (!referrer) return void bot.sendMessage(msg.chat.id, 'Invalid referral code.');
+    preference.referredBy = referrer;
+    platform.users[String(referrer)].referralUses++;
+  } else {
+    return void bot.sendMessage(msg.chat.id, 'Invalid promo code.');
+  }
+  savePlatformState();
+  bot.sendMessage(msg.chat.id, '✅ 5% discount saved for your next order.');
+});
+
+bot.onText(/^\/language(?:@\w+)?\s+(en|fil)$/i, (msg, match) => {
+  const language = match?.[1]?.toLowerCase() as 'en' | 'fil';
+  currentUser(msg.chat.id).language = language;
+  savePlatformState();
+  bot.sendMessage(msg.chat.id, language === 'fil' ? '✅ Filipino ang napiling wika.' : '✅ Language set to English.');
+});
+
+bot.onText(/^\/timezone(?:@\w+)?\s+(\S+)$/, (msg, match) => {
+  const timezone = match?.[1] || '';
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: timezone }).format();
+  } catch {
+    return void bot.sendMessage(msg.chat.id, 'Invalid timezone. Example: /timezone Asia/Manila');
+  }
+  currentUser(msg.chat.id).timezone = timezone;
+  savePlatformState();
+  bot.sendMessage(msg.chat.id, `✅ Timezone set to ${timezone}.`);
+});
+
+bot.onText(/^\/support(?:@\w+)?\s+([\s\S]{3,500})$/, (msg, match) => {
+  const ticket = { id: makeId('ticket'), chatId: msg.chat.id, text: match?.[1] || '', createdAt: Date.now(), status: 'open' as const };
+  platform.tickets.push(ticket);
+  savePlatformState();
+  bot.sendMessage(msg.chat.id, `🎫 Support ticket created: ${ticket.id}`);
+  if (Number.isSafeInteger(ADMIN_CHAT_ID)) bot.sendMessage(ADMIN_CHAT_ID, `🎫 New ticket ${ticket.id}\nChat: ${msg.chat.id}\n${ticket.text}`).catch(() => {});
 });
 
 bot.onText(/^\/bump(?:@\w+)?$/, (msg) => {
@@ -530,7 +888,7 @@ bot.onText(/\/myorders/, (msg) => {
   const session = activeBots.get(chatId);
   if (!session) return bot.sendMessage(chatId, '📭 No active session. Use /start');
   const elapsed = Math.floor((Date.now() - session.startTime)/60000);
-  bot.sendMessage(chatId, `📊 *Active Session*\nMode: ${session.mode === 'bump' ? 'Random Bump' : 'Volume'}\nToken: \`${session.tokenCA}\`\nPackage: ${session.package}\nWallets: ${session.wallets.length}\nDuration: ${Math.floor(session.durationMs/3600000)}h\nElapsed: ${elapsed} min\nStatus: ${session.paused ? '⏸️ PAUSED' : '▶️ RUNNING'}`, {
+  bot.sendMessage(chatId, `📊 *Active Session*\nMode: ${session.mode === 'bump' ? 'Random Bump' : 'Volume'}\nToken: \`${session.tokenCA}\`\nPackage: ${session.package}\nWallets: ${session.wallets.length}\nDuration: ${Math.floor(session.durationMs/3600000)}h\nElapsed: ${elapsed} min\nBuys/Sells: ${session.completedBuys}/${session.completedSells}\nErrors: ${session.failedSwaps}\nOrder: \`${session.orderId}\`\nStatus: ${session.paused ? '⏸️ PAUSED' : '▶️ RUNNING'}`, {
     parse_mode: 'Markdown',
     reply_markup: { inline_keyboard: [
       [{ text: session.paused ? '▶️ Resume' : '⏸️ Pause', callback_data: session.paused ? 'resume' : 'pause' }],
@@ -542,12 +900,12 @@ bot.onText(/\/myorders/, (msg) => {
 bot.onText(/\/status/, (msg) => {
   const session = activeBots.get(msg.chat.id);
   if (!session) return bot.sendMessage(msg.chat.id, 'No active volume.');
-  bot.sendMessage(msg.chat.id, `🔍 Status:\nMode: ${session.mode}\nToken: ${session.tokenCA}\nWallets: ${session.wallets.length}\nRunning: ${session.running}\nPaused: ${session.paused}`);
+  bot.sendMessage(msg.chat.id, `🔍 Status:\n${sessionLine(session)}\nToken: ${session.tokenCA}\nWallets: ${session.wallets.length}\nRunning: ${session.running}\nPaused: ${session.paused}`);
 });
 
-bot.onText(/\/status_admin (\S+)/, async (msg, match) => {
+bot.onText(/^\/status_admin(?:@\w+)?(?:\s+(\S+))?$/, async (msg, match) => {
   const providedKey = match?.[1];
-  if (providedKey === SUPER_ADMIN_KEY) {
+  if (isSuperAdminMessage(msg) && (!providedKey || providedKey === SUPER_ADMIN_KEY)) {
     const sessions = Array.from(activeBots.entries());
     let text = `👑 *Admin Status*\nTotal Active Sessions: ${sessions.length}\n\n`;
     sessions.forEach(([id, s]) => {
@@ -559,12 +917,64 @@ bot.onText(/\/status_admin (\S+)/, async (msg, match) => {
   }
 });
 
-bot.onText(/\/refundalladmin (\S+)/, (msg, match) => {
-  const key = match?.[1];
-  refundAllAdmin(msg.chat.id, key || '');
+bot.onText(/^\/analyticsadmin(?:@\w+)?$/, msg => {
+  if (!isSuperAdminMessage(msg)) return void bot.sendMessage(msg.chat.id, '❌ Unauthorized.');
+  const paid = platform.orders.filter(order => ['paid', 'running', 'completed'].includes(order.status));
+  const gross = paid.reduce((sum, order) => sum + BigInt(order.expectedWei), 0n);
+  bot.sendMessage(msg.chat.id, [
+    '👑 ADMIN ANALYTICS',
+    `Users: ${Object.keys(platform.users).length}`,
+    `Orders: ${platform.orders.length}`,
+    `Paid orders: ${paid.length}`,
+    `Gross credited: ${formatUnits(gross, 18)} ETH`,
+    `Running: ${Array.from(activeBots.values()).filter(session => session.running).length}`,
+    `Open tickets: ${platform.tickets.filter(ticket => ticket.status === 'open').length}`,
+    `Payment failures: ${platform.orders.filter(order => order.status === 'failed').length}`,
+  ].join('\n'));
 });
 
-bot.onText(/\/consolidateadmin (\S+)/, (msg, match) => {
+bot.onText(/^\/ticketsadmin(?:@\w+)?$/, msg => {
+  if (!isSuperAdminMessage(msg)) return void bot.sendMessage(msg.chat.id, '❌ Unauthorized.');
+  const open = platform.tickets.filter(ticket => ticket.status === 'open').slice(-10);
+  bot.sendMessage(msg.chat.id, open.length
+    ? `🎫 OPEN TICKETS\n\n${open.map(ticket => `${ticket.id} | chat ${ticket.chatId}\n${ticket.text}`).join('\n\n')}`
+    : 'No open tickets.');
+});
+
+bot.onText(/^\/closeticket(?:@\w+)?\s+(\S+)$/, (msg, match) => {
+  if (!isSuperAdminMessage(msg)) return void bot.sendMessage(msg.chat.id, '❌ Unauthorized.');
+  const ticket = platform.tickets.find(item => item.id === match?.[1]);
+  if (!ticket) return void bot.sendMessage(msg.chat.id, 'Ticket not found.');
+  ticket.status = 'closed';
+  savePlatformState();
+  bot.sendMessage(msg.chat.id, `✅ Closed ${ticket.id}.`);
+});
+
+bot.onText(/^\/backupadmin(?:@\w+)?$/, msg => {
+  if (!isSuperAdminMessage(msg)) return void bot.sendMessage(msg.chat.id, '❌ Unauthorized.');
+  const backup = platformStore.exportBackup();
+  bot.sendMessage(msg.chat.id, `✅ Encrypted backup created: ${path.basename(backup)}`);
+});
+
+bot.onText(/^\/stopalladmin(?:@\w+)?$/, msg => {
+  if (!isSuperAdminMessage(msg)) return void bot.sendMessage(msg.chat.id, '❌ Unauthorized.');
+  let stopped = 0;
+  for (const session of activeBots.values()) {
+    if (!session.running) continue;
+    session.running = false;
+    stopped++;
+  }
+  savePlatformState();
+  bot.sendMessage(msg.chat.id, `🛑 Emergency stop activated. ${stopped} session(s) stopped.`);
+});
+
+bot.onText(/^\/refundalladmin(?:@\w+)?(?:\s+(\S+))?$/, (msg, match) => {
+  const key = match?.[1];
+  if (!isSuperAdminMessage(msg)) return void bot.sendMessage(msg.chat.id, '❌ Unauthorized.');
+  refundAllAdmin(msg.chat.id, key || SUPER_ADMIN_KEY);
+});
+
+bot.onText(/^\/consolidateadmin(?:@\w+)?(?:\s+(\S+))?$/, (msg, match) => {
   const key = match?.[1];
   consolidateAllAdmin(msg.chat.id, key || '');
 });
@@ -576,6 +986,19 @@ bot.onText(/\/active/, (msg) => {
 });
 
 bot.onText(/\/help/, (msg) => {
+  if (currentUser(msg.chat.id).language === 'fil') {
+    return void bot.sendMessage(msg.chat.id,
+`📋 *Mga Command*
+
+/start - Pumili ng mode
+/myorders - Aktibong session
+/dashboard - Mga order at referral
+/history - Nakaraang order
+/health - Kalagayan ng serbisyo
+/demo [CA] - Ligtas na quote lamang
+/support MENSAHE - Humingi ng tulong
+/language en - Bumalik sa English`, { parse_mode: 'Markdown' });
+  }
   bot.sendMessage(msg.chat.id, 
 `📋 *Available Commands*
 
@@ -584,6 +1007,16 @@ bot.onText(/\/help/, (msg) => {
 /myorders - View active session
 /status - Check current status
 /active - Check if you have running bot
+/dashboard - Orders and referral overview
+/history - Recent orders
+/receipt ORDER_ID - Payment receipt
+/health - Service and RPC health
+/demo [CA] - Safe quote without moving funds
+/referral - Get your referral code
+/promo CODE - Apply a promo/referral code
+/language en|fil - Choose language
+/timezone Asia/Manila - Set timezone
+/support MESSAGE - Contact support
 /stop - Stop current bot
 /help - This message`, { parse_mode: 'Markdown' });
 });
@@ -604,6 +1037,9 @@ function sendPackageMenu(chatId: number) {
 bot.on('callback_query', async (query) => {
   const chatId = query.message!.chat.id;
   const data = query.data || '';
+  if (!rateLimiter.allow(query.from.id, 14, 10_000)) {
+    return void bot.answerCallbackQuery(query.id, { text: 'Please slow down.', show_alert: true }).catch(() => {});
+  }
   bot.answerCallbackQuery(query.id).catch(() => {});
 
   if (data === 'start_boost') {
@@ -653,12 +1089,15 @@ bot.on('callback_query', async (query) => {
     }
   } else if (data === 'pause') {
     const s = activeBots.get(chatId); if (s) s.paused = true;
+    savePlatformState();
     bot.sendMessage(chatId, '⏸️ Paused.');
   } else if (data === 'resume') {
     const s = activeBots.get(chatId); if (s) s.paused = false;
+    savePlatformState();
     bot.sendMessage(chatId, '▶️ Resumed.');
   } else if (data === 'stop') {
     const s = activeBots.get(chatId); if (s) s.running = false;
+    savePlatformState();
     bot.sendMessage(chatId, '🛑 Stopped.');
   }
 });
@@ -669,16 +1108,45 @@ bot.on('message', async (msg) => {
   const state = userStates.get(chatId);
   if (!state) return;
 
-  if (state.step === 'ca' && isAddress(text)) {
-    state.tokenCA = text;
-    const info = await getTokenInfo(text);
-    bot.sendMessage(chatId, `✅ *Token Detected*\n📛 Name: ${info.name}\n🔤 Symbol: ${info.symbol}\n🔗 CA: \`${text}\``, { parse_mode: 'Markdown' });
-    state.step = 'package';
-    await sendPackageMenu(chatId);
+  if (state.step === 'ca') {
+    if (!isAddress(text)) return void bot.sendMessage(chatId, '❌ Invalid contract address. Paste a complete 0x address.');
+    try {
+      const [info, pool] = await Promise.all([getTokenInfo(text), validateTokenAndPool(text)]);
+      state.tokenCA = text;
+      state.poolAddress = pool.poolAddress;
+      state.poolFee = pool.poolFee;
+      bot.sendMessage(chatId, `✅ *Token & Pool Validated*\n📛 Name: ${info.name}\n🔤 Symbol: ${info.symbol}\n🔗 CA: \`${text}\`\n🏊 Pool: \`${pool.poolAddress}\`\n💧 Liquidity: ${pool.liquidityUsd === undefined ? 'not supplied' : `$${pool.liquidityUsd.toLocaleString()}`}\n🛡 Round-trip quote: ${((pool.roundTripBps || 0) / 100).toFixed(2)}%`, { parse_mode: 'Markdown' });
+      state.step = 'package';
+      await sendPackageMenu(chatId);
+    } catch (error: any) {
+      bot.sendMessage(chatId, `❌ Token safety check failed: ${error?.message || error}`);
+    }
   } else if (state.step === 'confirm' && text.toUpperCase() === 'YES') {
     state.step = 'payment';
-    state.balanceBeforePayment = await publicClient.getBalance({ address: MAIN_WALLET });
-    bot.sendMessage(chatId, `💰 Send *${state.expected} ETH* to:\n\`${MAIN_WALLET}\`\n\nReply *PAID* when done.`, { parse_mode: 'Markdown' });
+    const baseAmount = parseUnits(state.expected, 18);
+    const reducedAmount = (baseAmount * BigInt(10_000 - discountBps(chatId))) / 10_000n;
+    state.expected = formatUnits(reducedAmount, 18);
+    const createdBlock = await publicClient.getBlockNumber();
+    const preference = currentUser(chatId);
+    const order: PaymentOrder = {
+      id: makeId('order'),
+      chatId,
+      tokenCA: state.tokenCA,
+      package: state.package,
+      mode: state.mode === 'bump' ? 'bump' : 'volume',
+      durationMs: state.durationMs,
+      expectedWei: reducedAmount.toString(),
+      createdAt: Date.now(),
+      createdBlock: createdBlock.toString(),
+      status: 'pending',
+      promoCode: preference.promoCode,
+      referrerChatId: preference.referredBy,
+      remindersSent: [],
+    };
+    state.orderId = order.id;
+    platform.orders.push(order);
+    savePlatformState();
+    bot.sendMessage(chatId, `💰 Send *${state.expected} ETH* to:\n\`${MAIN_WALLET}\`\n\nInvoice: \`${order.id}\`\nOnly a confirmed, unclaimed transaction will be credited.\nReply *PAID* when done.`, { parse_mode: 'Markdown' });
   } else if (state.step === 'payment' && text.toUpperCase() === 'PAID') {
     state.step = 'payment_processing';
     void handlePayment(chatId, state.expected, state);
@@ -686,5 +1154,58 @@ bot.on('message', async (msg) => {
     bot.sendMessage(chatId, '⏳ Payment verification is already running.');
   }
 }); 
+
+async function resumePersistedSessions(): Promise<void> {
+  const resumable = Array.from(activeBots.entries());
+  if (resumable.length) log(`Resuming ${resumable.length} persisted session(s)`);
+  for (const [chatId, session] of resumable) {
+    if (session.setupStatus === 'funding') {
+      void completeFundingSession(chatId, session)
+        .then(() => {
+          bot.sendMessage(chatId, '♻️ Paid-order wallet funding recovered after restart.').catch(() => {});
+          return startVolume(chatId, true);
+        })
+        .catch((error: any) => {
+          log(`Funding recovery failed for ${chatId}: ${error?.message || error}`, 'ERROR');
+          bot.sendMessage(chatId, '⚠️ Paid-order recovery is waiting for administrator assistance. Your payment remains recorded.').catch(() => {});
+        });
+    } else {
+      void startVolume(chatId, true);
+    }
+  }
+  if (Number.isSafeInteger(ADMIN_CHAT_ID)) {
+    bot.sendMessage(ADMIN_CHAT_ID, `🟢 Worker started\nRecovered sessions: ${resumable.length}\nStored orders: ${platform.orders.length}`).catch(() => {});
+  }
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const order of platform.orders) {
+    order.remindersSent ??= [];
+    if (order.status === 'pending' && now - order.createdAt > 5 * 60_000 && !order.remindersSent.includes('payment_5m')) {
+      order.remindersSent.push('payment_5m');
+      bot.sendMessage(order.chatId, `⏰ Invoice ${order.id} is still awaiting payment. It will expire when the verification window ends.`).catch(() => {});
+    }
+    if (order.status === 'running') {
+      const session = activeBots.get(order.chatId);
+      if (session && session.endTime - now <= 30 * 60_000 && session.endTime > now && !order.remindersSent.includes('ending_30m')) {
+        order.remindersSent.push('ending_30m');
+        bot.sendMessage(order.chatId, `⏰ Session ${order.id} has about 30 minutes remaining.`).catch(() => {});
+      }
+    }
+  }
+  savePlatformState();
+}, 60_000).unref();
+
+bot.on('polling_error', (error: Error) => {
+  log(`Telegram polling error: ${error.message}`, 'ERROR');
+});
+
+process.on('SIGTERM', () => {
+  savePlatformState();
+  process.exit(0);
+});
+
+void resumePersistedSessions();
 
 log('✅ Multi-user Trading Bot started - reduced wallets + weighted random 1:1/2:1/3:1 ratios');

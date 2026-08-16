@@ -15,6 +15,8 @@ services:
         sync: false
       - key: RPC_URL
         sync: false
+      - key: RPC_URL_BACKUP
+        sync: false
       - key: PRIVATE_KEY
         sync: false
       - key: ADMIN_CHAT_ID
@@ -23,6 +25,14 @@ services:
         sync: false
       - key: DATA_DIR
         value: /data
+      - key: DATA_ENCRYPTION_KEY
+        sync: false
+      - key: MIN_POOL_LIQUIDITY_USD
+        value: "1000"
+      - key: MAX_SLIPPAGE_BPS
+        value: "300"
+      - key: MIN_ROUND_TRIP_BPS
+        value: "5000"
     disk:
       name: huh-bot-data
       mountPath: /data
