@@ -44,13 +44,22 @@ export type PaymentOrder = {
   createdBlock: string;
   status: 'pending' | 'verifying' | 'paid' | 'running' | 'completed' | 'failed' | 'expired';
   paymentTxHash?: string;
+  submittedPaymentTxHash?: string;
   lastScannedBlock?: string;
+  verificationStartedAt?: number;
   commissionTxHash?: string;
   failureReason?: string;
   completedAt?: number;
   promoCode?: string;
   referrerChatId?: number;
   remindersSent?: string[];
+  poolAddress?: string;
+  poolVersion?: 'v3' | 'v4';
+  poolFee?: number;
+  poolTickSpacing?: number;
+  poolCurrency0?: string;
+  poolCurrency1?: string;
+  poolHooks?: string;
 };
 
 export type SupportTicket = {

@@ -10,7 +10,7 @@
     "start:volume": "ts-node bot.ts",
     "start:buybot": "ts-node buybot.ts",
     "typecheck": "tsc --noEmit",
-    "test": "npm run typecheck && ts-node platform-state.test.ts && ts-node v4.test.ts"
+    "test": "npm run typecheck && ts-node platform-state.test.ts && ts-node v4.test.ts && ts-node payment-verifier.test.ts"
   },
   "keywords": [],
   "author": "",

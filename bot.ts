@@ -28,6 +28,10 @@ import {
   encodeV4ExactInputSingle, PERMIT2_ABI, V4_POOL_MANAGER_ABI, V4_QUOTER_ABI,
   type V4PoolKey,
 } from './v4';
+import {
+  blockscoutCandidateHashes, extractPaymentTxHash, matchesPayment,
+  type PaymentMatch,
+} from './payment-verifier';
 
 dotenv.config();
 
@@ -41,6 +45,13 @@ const ARCHIVE_FOLDER = path.join(DATA_FOLDER, 'archive_folder');
 const platformStore = new PlatformStateStore(DATA_FOLDER);
 const platform = platformStore.get();
 const rateLimiter = new SlidingWindowRateLimiter();
+const paymentVerifiers = new Set<string>();
+const BLOCKSCOUT_API = 'https://robinhoodchain.blockscout.com/api/v2';
+const PAYMENT_POLL_MS = 2_500;
+const PAYMENT_POLL_ATTEMPTS = 144;
+const RECENT_PAYMENT_BLOCKS = 120n;
+const HISTORICAL_SCAN_BLOCKS = 64n;
+const RPC_BLOCK_BATCH_SIZE = 16;
 
 fs.mkdirSync(PRIVATE_FOLDER, { recursive: true });
 fs.mkdirSync(ARCHIVE_FOLDER, { recursive: true });
@@ -610,33 +621,114 @@ async function fundWallets(wallets: { privateKey: string }[], amountPerWallet: s
   if (failures.length) throw new Error(`Funding incomplete for ${failures.length} wallet(s)`);
 }
 
-async function findPaymentTransaction(order: PaymentOrder): Promise<string | undefined> {
-  const latest = await publicClient.getBlockNumber();
-  const created = BigInt(order.createdBlock);
-  let cursor = order.lastScannedBlock ? BigInt(order.lastScannedBlock) + 1n : created;
-  if (cursor > latest) return undefined;
-  // Bound each poll to avoid overwhelming the RPC during busy periods.
-  const end = cursor + 24n < latest ? cursor + 24n : latest;
-  const expected = BigInt(order.expectedWei);
-  const claimed = new Set(platform.claimedPaymentTxHashes.map(hash => hash.toLowerCase()));
+function paymentMatch(order: PaymentOrder, allowOverpayment = false): PaymentMatch {
+  return {
+    expectedWei: BigInt(order.expectedWei),
+    createdBlock: BigInt(order.createdBlock),
+    destination: MAIN_WALLET,
+    claimedHashes: new Set(platform.claimedPaymentTxHashes.map(hash => hash.toLowerCase())),
+    allowOverpayment,
+  };
+}
 
-  for (; cursor <= end; cursor++) {
-    const block = await publicClient.getBlock({ blockNumber: cursor, includeTransactions: true });
-    for (const transaction of block.transactions) {
-      if (typeof transaction === 'string') continue;
-      if (!transaction.to || transaction.to.toLowerCase() !== MAIN_WALLET.toLowerCase()) continue;
-      if (transaction.value < expected || claimed.has(transaction.hash.toLowerCase())) continue;
-      const receipt = await publicClient.getTransactionReceipt({ hash: transaction.hash });
-      if (receipt.status === 'success') {
-        order.lastScannedBlock = cursor.toString();
-        savePlatformState();
-        return transaction.hash;
+async function verifyPaymentHash(
+  order: PaymentOrder,
+  hash: `0x${string}`,
+  allowOverpayment = false,
+): Promise<string | undefined> {
+  try {
+    const [transaction, receipt] = await Promise.all([
+      publicClient.getTransaction({ hash }),
+      publicClient.getTransactionReceipt({ hash }),
+    ]);
+    return matchesPayment({
+      hash,
+      to: transaction.to,
+      value: transaction.value,
+      blockNumber: receipt.blockNumber,
+      succeeded: receipt.status === 'success',
+    }, paymentMatch(order, allowOverpayment)) ? hash : undefined;
+  } catch {
+    // A transaction may still be pending or a single RPC endpoint may be behind.
+    return undefined;
+  }
+}
+
+async function findPaymentViaBlockscout(order: PaymentOrder): Promise<string | undefined> {
+  const response = await fetch(`${BLOCKSCOUT_API}/addresses/${MAIN_WALLET}/transactions?filter=to`, {
+    signal: AbortSignal.timeout(3_500),
+    headers: { accept: 'application/json' },
+  });
+  if (!response.ok) throw new Error(`Blockscout returned HTTP ${response.status}`);
+  const candidates = blockscoutCandidateHashes(await response.json(), paymentMatch(order));
+  for (const hash of candidates) {
+    const verified = await verifyPaymentHash(order, hash);
+    if (verified) return verified;
+  }
+  return undefined;
+}
+
+async function scanPaymentBlocks(order: PaymentOrder, blockNumbers: bigint[]): Promise<string | undefined> {
+  const match = paymentMatch(order);
+  for (let offset = 0; offset < blockNumbers.length; offset += RPC_BLOCK_BATCH_SIZE) {
+    const batch = blockNumbers.slice(offset, offset + RPC_BLOCK_BATCH_SIZE);
+    const blocks = await Promise.all(batch.map(blockNumber =>
+      publicClient.getBlock({ blockNumber, includeTransactions: true }).catch(() => undefined),
+    ));
+    for (const block of blocks) {
+      if (!block) continue;
+      for (const transaction of block.transactions) {
+        if (typeof transaction === 'string' || !transaction.to) continue;
+        if (transaction.to.toLowerCase() !== MAIN_WALLET.toLowerCase()) continue;
+        if (transaction.value < match.expectedWei || match.claimedHashes.has(transaction.hash.toLowerCase())) continue;
+        const verified = await verifyPaymentHash(order, transaction.hash);
+        if (verified) return verified;
       }
     }
-    order.lastScannedBlock = cursor.toString();
   }
-  savePlatformState();
   return undefined;
+}
+
+async function findPaymentTransaction(
+  order: PaymentOrder,
+  preferredHash?: `0x${string}`,
+  scanRecent = false,
+  useExplorer = true,
+): Promise<string | undefined> {
+  const submittedHash = preferredHash || extractPaymentTxHash(order.submittedPaymentTxHash || '');
+  if (submittedHash) {
+    const direct = await verifyPaymentHash(order, submittedHash, true);
+    if (direct) return direct;
+  }
+
+  if (useExplorer) {
+    try {
+      const indexed = await findPaymentViaBlockscout(order);
+      if (indexed) return indexed;
+    } catch (error: any) {
+      log(`Blockscout payment lookup unavailable: ${error?.message || error}`, 'WARN');
+    }
+  }
+
+  const latest = await publicClient.getBlockNumber();
+  const created = BigInt(order.createdBlock);
+  if (scanRecent && latest >= created) {
+    const recentStart = latest - created > RECENT_PAYMENT_BLOCKS ? latest - RECENT_PAYMENT_BLOCKS : created;
+    const recentBlocks: bigint[] = [];
+    for (let blockNumber = latest; blockNumber >= recentStart; blockNumber--) recentBlocks.push(blockNumber);
+    const recent = await scanPaymentBlocks(order, recentBlocks);
+    if (recent) return recent;
+  }
+
+  let cursor = order.lastScannedBlock ? BigInt(order.lastScannedBlock) + 1n : created;
+  if (cursor > latest) return undefined;
+  const end = cursor + HISTORICAL_SCAN_BLOCKS - 1n < latest ? cursor + HISTORICAL_SCAN_BLOCKS - 1n : latest;
+  const historicalBlocks: bigint[] = [];
+  for (let blockNumber = cursor; blockNumber <= end; blockNumber++) historicalBlocks.push(blockNumber);
+  const historical = await scanPaymentBlocks(order, historicalBlocks);
+  order.lastScannedBlock = end.toString();
+  savePlatformState();
+  return historical;
 }
 
 async function completeFundingSession(chatId: number, session: ActiveSession): Promise<void> {
@@ -663,85 +755,163 @@ async function completeFundingSession(chatId: number, session: ActiveSession): P
   savePlatformState();
 }
 
-async function handlePayment(chatId: number, expectedAmount: string, state: any): Promise<void> {
-  const expected = parseUnits(expectedAmount, 18);
+async function paymentStateFromOrder(order: PaymentOrder): Promise<any> {
+  let pool: PoolDiscovery;
+  if (order.poolAddress && order.poolVersion && order.poolFee !== undefined) {
+    pool = {
+      poolAddress: order.poolAddress,
+      poolVersion: order.poolVersion,
+      poolFee: order.poolFee,
+      poolTickSpacing: order.poolTickSpacing,
+      poolCurrency0: order.poolCurrency0 as Address | undefined,
+      poolCurrency1: order.poolCurrency1 as Address | undefined,
+      poolHooks: order.poolHooks as Address | undefined,
+    };
+  } else {
+    pool = await validateTokenAndPool(order.tokenCA);
+    order.poolAddress = pool.poolAddress;
+    order.poolVersion = pool.poolVersion;
+    order.poolFee = pool.poolFee;
+    order.poolTickSpacing = pool.poolTickSpacing;
+    order.poolCurrency0 = pool.poolCurrency0;
+    order.poolCurrency1 = pool.poolCurrency1;
+    order.poolHooks = pool.poolHooks;
+    savePlatformState();
+  }
+  return {
+    step: 'payment_processing',
+    orderId: order.id,
+    expected: formatUnits(BigInt(order.expectedWei), 18),
+    tokenCA: order.tokenCA,
+    package: order.package,
+    mode: order.mode,
+    durationMs: order.durationMs,
+    poolAddress: pool.poolAddress,
+    poolVersion: pool.poolVersion,
+    poolFee: pool.poolFee,
+    poolTickSpacing: pool.poolTickSpacing,
+    poolCurrency0: pool.poolCurrency0,
+    poolCurrency1: pool.poolCurrency1,
+    poolHooks: pool.poolHooks,
+  };
+}
+
+async function fulfillVerifiedPayment(
+  chatId: number,
+  order: PaymentOrder,
+  state: any,
+  paymentTxHash: string,
+): Promise<void> {
+  // Claim this order before any awaited setup work so a second verifier cannot
+  // credit the same payment.
+  order.status = 'paid';
+  order.paymentTxHash = paymentTxHash;
+  if (!platform.claimedPaymentTxHashes.some(hash => hash.toLowerCase() === paymentTxHash.toLowerCase())) {
+    platform.claimedPaymentTxHashes.push(paymentTxHash);
+  }
+  savePlatformState();
+  userStates.delete(chatId);
+  await bot.sendMessage(chatId, `✅ Payment confirmed!\nReceipt: \`${order.id}\`\nTransaction: \`${paymentTxHash}\`\nPreparing wallets…`, { parse_mode: 'Markdown' });
+
+  try {
+    const expected = BigInt(order.expectedWei);
+    const mode: BotMode = state.mode === 'bump' ? 'bump' : 'volume';
+    const walletCount = getWalletCount(state.package, mode);
+    const sessionWallets = generateWallets(walletCount);
+    saveWalletsToFile(chatId, state.tokenCA, sessionWallets);
+
+    const usable = (expected * 80n) / 100n;
+    const perWallet = usable / BigInt(walletCount);
+    const session: ActiveSession = {
+      tokenCA: state.tokenCA,
+      running: false,
+      paused: false,
+      package: state.package,
+      mode,
+      durationMs: state.durationMs,
+      wallets: sessionWallets,
+      startTime: Date.now(),
+      endTime: Date.now() + state.durationMs,
+      orderId: order.id,
+      poolAddress: state.poolAddress,
+      poolVersion: state.poolVersion,
+      poolFee: state.poolFee,
+      poolTickSpacing: state.poolTickSpacing,
+      poolCurrency0: state.poolCurrency0,
+      poolCurrency1: state.poolCurrency1,
+      poolHooks: state.poolHooks,
+      completedBuys: 0,
+      completedSells: 0,
+      failedSwaps: 0,
+      lastActivityAt: Date.now(),
+      setupStatus: 'funding',
+      fundingTargetWei: perWallet.toString(),
+    };
+    activeBots.set(chatId, session);
+    savePlatformState();
+    await completeFundingSession(chatId, session);
+    void startVolume(chatId);
+  } catch (error: any) {
+    order.status = activeBots.get(chatId)?.setupStatus === 'funding' ? 'paid' : 'failed';
+    order.failureReason = error?.message || String(error);
+    savePlatformState();
+    log(`Paid order setup failed for chatId ${chatId}: ${error?.message || error}`, 'ERROR');
+    await bot.sendMessage(chatId, '❌ Payment was confirmed, but wallet setup failed. Contact the administrator; the payment will not be charged twice.');
+  }
+}
+
+async function handlePayment(
+  chatId: number,
+  state: any,
+  preferredHash?: `0x${string}`,
+  announce = true,
+): Promise<void> {
   const order = orderById(state.orderId);
   if (!order) {
     userStates.delete(chatId);
     await bot.sendMessage(chatId, '❌ Payment invoice was not found. Start again with /start.');
     return;
   }
-  order.status = 'verifying';
-  savePlatformState();
-  bot.sendMessage(chatId, `⏳ Verifying *${expectedAmount} ETH* on \`${MAIN_WALLET}\``, { parse_mode: 'Markdown' });
-  for (let i = 0; i < 72; i++) {
-    if (i > 0) await sleep(5000);
-    try {
-      const paymentTxHash = await findPaymentTransaction(order);
-      if (paymentTxHash) {
-        // Claim this order before any awaited setup work so no second PAID
-        // message or verifier can confirm the same payment again.
-        order.status = 'paid';
-        order.paymentTxHash = paymentTxHash;
-        platform.claimedPaymentTxHashes.push(paymentTxHash);
-        savePlatformState();
-        userStates.delete(chatId);
-        await bot.sendMessage(chatId, `✅ Payment confirmed!\nReceipt: \`${order.id}\`\nPreparing wallets…`, { parse_mode: 'Markdown' });
-
-        try {
-          const mode: BotMode = state.mode === 'bump' ? 'bump' : 'volume';
-          const walletCount = getWalletCount(state.package, mode);
-          const sessionWallets = generateWallets(walletCount);
-          saveWalletsToFile(chatId, state.tokenCA, sessionWallets);
-
-          const usable = (expected * 80n) / 100n;
-          const perWallet = usable / BigInt(walletCount);
-          const session: ActiveSession = {
-            tokenCA: state.tokenCA,
-            running: false,
-            paused: false,
-            package: state.package,
-            mode,
-            durationMs: state.durationMs,
-            wallets: sessionWallets,
-            startTime: Date.now(),
-            endTime: Date.now() + state.durationMs,
-            orderId: order.id,
-            poolAddress: state.poolAddress,
-            poolVersion: state.poolVersion,
-            poolFee: state.poolFee,
-            poolTickSpacing: state.poolTickSpacing,
-            poolCurrency0: state.poolCurrency0,
-            poolCurrency1: state.poolCurrency1,
-            poolHooks: state.poolHooks,
-            completedBuys: 0,
-            completedSells: 0,
-            failedSwaps: 0,
-            lastActivityAt: Date.now(),
-            setupStatus: 'funding',
-            fundingTargetWei: perWallet.toString(),
-          };
-          activeBots.set(chatId, session);
-          savePlatformState();
-          await completeFundingSession(chatId, session);
-          void startVolume(chatId);
-        } catch (error: any) {
-          order.status = activeBots.get(chatId)?.setupStatus === 'funding' ? 'paid' : 'failed';
-          order.failureReason = error?.message || String(error);
-          savePlatformState();
-          log(`Paid order setup failed for chatId ${chatId}: ${error?.message || error}`, 'ERROR');
-          await bot.sendMessage(chatId, '❌ Payment was confirmed, but wallet setup failed. Contact the administrator; the payment will not be charged twice.');
-        }
-        return;
-      }
-    } catch (error: any) {
-      log(`Payment verification error for chatId ${chatId}: ${error?.message || error}`, 'WARN');
-    }
+  if (preferredHash) order.submittedPaymentTxHash = preferredHash;
+  if (paymentVerifiers.has(order.id)) {
+    savePlatformState();
+    if (preferredHash) await bot.sendMessage(chatId, '⚡ Transaction hash attached. Checking it now…');
+    return;
   }
-  userStates.delete(chatId);
-  order.status = 'expired';
+
+  paymentVerifiers.add(order.id);
+  order.status = 'verifying';
+  order.verificationStartedAt ??= Date.now();
   savePlatformState();
-  bot.sendMessage(chatId, '❌ Payment not detected.');
+  if (announce) {
+    await bot.sendMessage(chatId, `⏳ Verifying *${formatUnits(BigInt(order.expectedWei), 18)} ETH* on \`${MAIN_WALLET}\`\n\n⚡ A transaction hash or Blockscout link verifies fastest. Send:\n\`PAID 0x...\``, { parse_mode: 'Markdown' });
+  }
+
+  try {
+    for (let i = 0; i < PAYMENT_POLL_ATTEMPTS; i++) {
+      if (i > 0) await sleep(PAYMENT_POLL_MS);
+      try {
+        const paymentTxHash = await findPaymentTransaction(
+          order,
+          extractPaymentTxHash(order.submittedPaymentTxHash || ''),
+          i === 0 || i % 12 === 0,
+          i % 2 === 0,
+        );
+        if (paymentTxHash) {
+          await fulfillVerifiedPayment(chatId, order, state, paymentTxHash);
+          return;
+        }
+      } catch (error: any) {
+        log(`Payment verification error for chatId ${chatId}: ${error?.message || error}`, 'WARN');
+      }
+    }
+    userStates.delete(chatId);
+    order.status = 'expired';
+    savePlatformState();
+    await bot.sendMessage(chatId, `❌ Payment not detected yet. Your invoice is saved. Use \`/verify TX_HASH\` to check the transaction directly.`, { parse_mode: 'Markdown' });
+  } finally {
+    paymentVerifiers.delete(order.id);
+  }
 }
 
 // === Admin & Other Functions (unchanged) ===
@@ -968,6 +1138,36 @@ bot.onText(/^\/receipt(?:@\w+)?\s+(\S+)$/, (msg, match) => {
   ].join('\n'));
 });
 
+bot.onText(/^\/verify(?:@\w+)?\s+(\S+)$/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const submittedHash = extractPaymentTxHash(match?.[1] || '');
+  if (!submittedHash) {
+    await bot.sendMessage(chatId, '❌ Send a complete transaction hash or Blockscout transaction link.\nExample: /verify 0x...');
+    return;
+  }
+  const order = [...platform.orders].reverse().find(candidate =>
+    candidate.chatId === chatId && ['pending', 'verifying', 'expired'].includes(candidate.status),
+  );
+  if (!order) {
+    await bot.sendMessage(chatId, '❌ No unpaid invoice was found for this chat. Use /start to create one.');
+    return;
+  }
+  order.status = 'verifying';
+  order.submittedPaymentTxHash = submittedHash;
+  savePlatformState();
+  try {
+    const state = userStates.get(chatId) || await paymentStateFromOrder(order);
+    state.step = 'payment_processing';
+    state.orderId = order.id;
+    userStates.set(chatId, state);
+    await bot.sendMessage(chatId, `⚡ Checking transaction \`${submittedHash}\` for invoice \`${order.id}\`…`, { parse_mode: 'Markdown' });
+    void handlePayment(chatId, state, submittedHash, false);
+  } catch (error: any) {
+    log(`Direct payment verification setup failed for ${chatId}: ${error?.message || error}`, 'ERROR');
+    await bot.sendMessage(chatId, '❌ Could not prepare this invoice for verification. Please contact the administrator.');
+  }
+});
+
 bot.onText(/^\/health(?:@\w+)?$/, msg => void sendHealth(msg.chat.id));
 
 bot.onText(/^\/demo(?:@\w+)?(?:\s+(0x[a-fA-F0-9]{40}))?$/, async (msg, match) => {
@@ -1156,6 +1356,7 @@ bot.onText(/\/help/, (msg) => {
 /myorders - Aktibong session
 /dashboard - Mga order at referral
 /history - Nakaraang order
+/verify TX_HASH - Direktang payment verification
 /health - Kalagayan ng serbisyo
 /demo [CA] - Ligtas na quote lamang
 /support MENSAHE - Humingi ng tulong
@@ -1172,6 +1373,7 @@ bot.onText(/\/help/, (msg) => {
 /dashboard - Orders and referral overview
 /history - Recent orders
 /receipt ORDER_ID - Payment receipt
+/verify TX_HASH - Instantly verify a payment
 /health - Service and RPC health
 /demo [CA] - Safe quote without moving funds
 /referral - Get your referral code
@@ -1311,16 +1513,28 @@ bot.on('message', async (msg) => {
       promoCode: preference.promoCode,
       referrerChatId: preference.referredBy,
       remindersSent: [],
+      poolAddress: state.poolAddress,
+      poolVersion: state.poolVersion,
+      poolFee: state.poolFee,
+      poolTickSpacing: state.poolTickSpacing,
+      poolCurrency0: state.poolCurrency0,
+      poolCurrency1: state.poolCurrency1,
+      poolHooks: state.poolHooks,
     };
     state.orderId = order.id;
     platform.orders.push(order);
     savePlatformState();
-    bot.sendMessage(chatId, `💰 Send *${state.expected} ETH* to:\n\`${MAIN_WALLET}\`\n\nInvoice: \`${order.id}\`\nOnly a confirmed, unclaimed transaction will be credited.\nReply *PAID* when done.`, { parse_mode: 'Markdown' });
-  } else if (state.step === 'payment' && text.toUpperCase() === 'PAID') {
+    bot.sendMessage(chatId, `💰 Send *${state.expected} ETH* to:\n\`${MAIN_WALLET}\`\n\nInvoice: \`${order.id}\`\nOnly a confirmed, unclaimed transaction will be credited.\n\n⚡ Fastest: reply *PAID* followed by the transaction hash or Blockscout link.\nExample: \`PAID 0x...\`\n\nPlain *PAID* also works.`, { parse_mode: 'Markdown' });
+  } else if (state.step === 'payment' && /^PAID(?:\s|$)/i.test(text)) {
     state.step = 'payment_processing';
-    void handlePayment(chatId, state.expected, state);
-  } else if (state.step === 'payment_processing' && text.toUpperCase() === 'PAID') {
-    bot.sendMessage(chatId, '⏳ Payment verification is already running.');
+    void handlePayment(chatId, state, extractPaymentTxHash(text));
+  } else if (state.step === 'payment_processing' && /^PAID(?:\s|$)/i.test(text)) {
+    const submittedHash = extractPaymentTxHash(text);
+    if (submittedHash) {
+      void handlePayment(chatId, state, submittedHash, false);
+    } else {
+      bot.sendMessage(chatId, '⏳ Payment verification is already running. Send `PAID TX_HASH` for an immediate direct check.', { parse_mode: 'Markdown' });
+    }
   }
 }); 
 
@@ -1342,8 +1556,27 @@ async function resumePersistedSessions(): Promise<void> {
       void startVolume(chatId, true);
     }
   }
+  const seenPaymentChats = new Set<number>();
+  const verifyingOrders = [...platform.orders].reverse().filter(order => {
+    if (order.status !== 'verifying' || order.paymentTxHash || seenPaymentChats.has(order.chatId)) return false;
+    seenPaymentChats.add(order.chatId);
+    return true;
+  });
+  if (verifyingOrders.length) log(`Resuming ${verifyingOrders.length} payment verifier(s)`);
+  for (const order of verifyingOrders) {
+    void paymentStateFromOrder(order)
+      .then(state => {
+        userStates.set(order.chatId, state);
+        bot.sendMessage(order.chatId, `♻️ Resuming payment verification for invoice ${order.id}.`).catch(() => {});
+        return handlePayment(order.chatId, state, extractPaymentTxHash(order.submittedPaymentTxHash || ''), false);
+      })
+      .catch((error: any) => {
+        log(`Payment verification recovery failed for ${order.chatId}: ${error?.message || error}`, 'ERROR');
+        bot.sendMessage(order.chatId, `⚠️ Could not resume invoice ${order.id}. Use /verify TX_HASH for a direct check.`).catch(() => {});
+      });
+  }
   if (Number.isSafeInteger(ADMIN_CHAT_ID)) {
-    bot.sendMessage(ADMIN_CHAT_ID, `🟢 Worker started\nRecovered sessions: ${resumable.length}\nStored orders: ${platform.orders.length}`).catch(() => {});
+    bot.sendMessage(ADMIN_CHAT_ID, `🟢 Worker started\nRecovered sessions: ${resumable.length}\nRecovered payment verifiers: ${verifyingOrders.length}\nStored orders: ${platform.orders.length}`).catch(() => {});
   }
 }
 

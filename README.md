@@ -23,6 +23,7 @@ State encryption uses `DATA_ENCRYPTION_KEY`. If it is absent, the controller `PR
 - `/start`, `/bump` — create an order.
 - `/myorders`, `/status`, `/active` — session controls and statistics.
 - `/dashboard`, `/history`, `/receipt ORDER_ID` — account and payment records.
+- `/verify TX_HASH` — directly verify a delayed or timed-out payment.
 - `/health`, `/demo [CA]` — read-only diagnostics and quote simulation.
 - `/referral`, `/promo CODE` — referral and promotion flow.
 - `/language en|fil`, `/timezone Asia/Manila` — preferences.
@@ -42,7 +43,7 @@ Alert presentation supports images, GIFs, videos, standard emoji, Telegram custo
 
 ## Payment safety
 
-Invoices record the creation block. Verification scans confirmed native transfers to the controller wallet and permanently claims a specific transaction hash. A transaction cannot credit two orders. Paid-order setup failures stay recorded for administrator recovery.
+Invoices record the creation block. `PAID TX_HASH` or `PAID BLOCKSCOUT_LINK` verifies a confirmed payment directly; plain `PAID` checks Blockscout's recent incoming index first and then scans recent and historical RPC blocks in parallel batches. Automatic matching requires the exact invoice amount, while a user-supplied transaction hash can safely accept an overpayment. Every match is revalidated through the RPC, permanently claimed, and cannot credit two orders. In-progress verifiers resume after a worker restart, and `/verify TX_HASH` recovers an expired invoice. Paid-order setup failures stay recorded for administrator recovery.
 
 ## Trading safety
 
