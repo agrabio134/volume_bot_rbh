@@ -27,14 +27,17 @@ try {
     failedSwaps: 0,
     lastActivityAt: Date.now(),
   };
+  state.bumpWalletPools['123'] = [{ privateKey: '0xreusable-bump-key' }];
   store.save();
 
   const encrypted = fs.readFileSync(path.join(temporary, 'platform-state.enc'), 'utf8');
   assert.equal(encrypted.includes('secret-wallet-key'), false, 'private keys must not be written as plaintext');
+  assert.equal(encrypted.includes('reusable-bump-key'), false, 'reusable bump keys must be encrypted');
 
   const restored = new PlatformStateStore(temporary).get();
   assert.equal(restored.sessions['123'].orderId, 'order_test');
   assert.equal(restored.sessions['123'].wallets[0].privateKey, '0xsecret-wallet-key');
+  assert.equal(restored.bumpWalletPools['123'][0].privateKey, '0xreusable-bump-key');
 
   const limiter = new SlidingWindowRateLimiter();
   assert.equal(limiter.allow(1, 2, 10_000), true);

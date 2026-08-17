@@ -45,6 +45,10 @@ Alert presentation supports images, GIFs, videos, standard emoji, Telegram custo
 
 Invoices record the creation block. `PAID TX_HASH` or `PAID BLOCKSCOUT_LINK` verifies a confirmed payment directly; plain `PAID` checks Blockscout's recent incoming index first and then scans recent and historical RPC blocks in parallel batches. Automatic matching requires the exact invoice amount, while a user-supplied transaction hash can safely accept an overpayment. Every match is revalidated through the RPC, permanently claimed, and cannot credit two orders. In-progress verifiers resume after a worker restart, and `/verify TX_HASH` recovers an expired invoice. Paid-order setup failures stay recorded for administrator recovery.
 
+## Bump mode
+
+Bump mode is separate from volume mode. It uses 8–32 wallets by package, sends fixed 0.00001 ETH buys in 6–12 multi-wallet rounds, and only then sells from a randomized 20–35% of the wallets. Wallet order and participation are shuffled every round. Approximately 70% of a chat's encrypted bump-wallet pool is reused on later bump orders while the remainder is refreshed, so the bot does not generate an entirely new set every time. These remain controlled-wallet transactions and should not be represented as organic traders.
+
 ## Trading safety
 
 Before an invoice is created, the volume bot checks contract bytecode, discovers and verifies a Uniswap V3 WETH or V4 native-ETH pool, enforces the configured liquidity minimum, and runs a two-way quote. V3 swaps use SwapRouter02; V4 swaps use Robinhood Chain's official PoolManager, V4Quoter, Universal Router and Permit2 deployments. Each swap uses a quote-derived minimum output and can enforce gas-price and daily-buy limits. `/stopalladmin` is the emergency stop.

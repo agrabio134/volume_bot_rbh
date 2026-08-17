@@ -79,8 +79,9 @@ export type UserPreference = {
 };
 
 export type PlatformState = {
-  version: 2;
+  version: 3;
   sessions: Record<string, PersistedSession>;
+  bumpWalletPools: Record<string, PersistedWallet[]>;
   orders: PaymentOrder[];
   tickets: SupportTicket[];
   users: Record<string, UserPreference>;
@@ -89,8 +90,9 @@ export type PlatformState = {
 };
 
 const defaults = (): PlatformState => ({
-  version: 2,
+  version: 3,
   sessions: {},
+  bumpWalletPools: {},
   orders: [],
   tickets: [],
   users: {},
@@ -172,8 +174,9 @@ export class PlatformStateStore {
       return {
         ...base,
         ...saved,
-        version: 2,
+        version: 3,
         sessions: saved.sessions || {},
+        bumpWalletPools: saved.bumpWalletPools || {},
         orders: saved.orders || [],
         tickets: saved.tickets || [],
         users: saved.users || {},
