@@ -47,7 +47,7 @@ Invoices record the creation block. `PAID TX_HASH` or `PAID BLOCKSCOUT_LINK` ver
 
 ## Bump mode
 
-Bump mode is separate from volume mode. It uses 8–32 wallets by package, sends fixed 0.00001 ETH buys in 6–12 multi-wallet rounds, and only then sells from a randomized 20–35% of the wallets. Wallet order and participation are shuffled every round. Approximately 70% of a chat's encrypted bump-wallet pool is reused on later bump orders while the remainder is refreshed, so the bot does not generate an entirely new set every time. These remain controlled-wallet transactions and should not be represented as organic traders.
+Bump mode is separate from volume mode. It uses 30, 40, 50, 70 or 100 wallets by package. Fixed 0.00001 ETH buys execute concurrently in batches of up to 10 distinct wallets across 6–12 multi-wallet rounds, and only then does a randomized 20–35% of the wallets sell. Wallet order and participation are shuffled every round. Daily-buy allowance is reserved atomically per concurrent batch. Approximately 70% of a chat's encrypted bump-wallet pool is reused on later bump orders while the remainder is refreshed, so the bot does not generate an entirely new set every time. These remain controlled-wallet transactions and should not be represented as organic traders.
 
 ## Trading safety
 

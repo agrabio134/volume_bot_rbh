@@ -33,7 +33,7 @@ import {
   type PaymentMatch,
 } from './payment-verifier';
 import {
-  BUMP_BUY_ETH, bumpBuyRounds, bumpReuseCount, bumpRoundWalletCount,
+  BUMP_BUY_CONCURRENCY, BUMP_BUY_ETH, bumpBuyRounds, bumpReuseCount, bumpRoundWalletCount,
   bumpSellerCount, bumpWalletCount,
 } from './bump-config';
 
@@ -57,7 +57,7 @@ const RECENT_PAYMENT_BLOCKS = 120n;
 const HISTORICAL_SCAN_BLOCKS = 64n;
 const RPC_BLOCK_BATCH_SIZE = 16;
 const BUMP_BUY_WEI = parseUnits(BUMP_BUY_ETH, 18);
-const MAX_REUSABLE_BUMP_WALLETS_PER_CHAT = 80;
+const MAX_REUSABLE_BUMP_WALLETS_PER_CHAT = 240;
 
 fs.mkdirSync(PRIVATE_FOLDER, { recursive: true });
 fs.mkdirSync(ARCHIVE_FOLDER, { recursive: true });
@@ -347,6 +347,22 @@ async function getTokenInfo(tokenCA: string) {
   }
 }
 
+function checkDailyBuy(session: ActiveSession, amountWei: bigint): bigint {
+  if (!session.dailyWindowStartedAt || Date.now() - session.dailyWindowStartedAt >= 24 * 60 * 60 * 1000) {
+    session.dailyWindowStartedAt = Date.now();
+    session.dailyBuyWei = '0';
+  }
+  const dailyLimit = parseUnits(process.env.MAX_SESSION_DAILY_BUY_ETH || '0', 18);
+  const spentToday = BigInt(session.dailyBuyWei || '0');
+  if (dailyLimit > 0n && spentToday + amountWei > dailyLimit) throw new Error('Session daily buy limit reached');
+  return spentToday;
+}
+
+function reserveDailyBuy(session: ActiveSession, amountWei: bigint): void {
+  const spentToday = checkDailyBuy(session, amountWei);
+  session.dailyBuyWei = (spentToday + amountWei).toString();
+}
+
 async function executeSwap(walletPk: string, session: ActiveSession, isBuy: boolean): Promise<bigint> {
   const { tokenCA, durationMs, mode } = session;
   const account = privateKeyToAccount(walletPk as `0x${string}`);
@@ -371,15 +387,11 @@ async function executeSwap(walletPk: string, session: ActiveSession, isBuy: bool
           return (nativeBalance * BigInt(Math.floor(baseBps * aggression))) / 10000n;
         })();
 
-    if (!session.dailyWindowStartedAt || Date.now() - session.dailyWindowStartedAt >= 24 * 60 * 60 * 1000) {
-      session.dailyWindowStartedAt = Date.now();
-      session.dailyBuyWei = '0';
-    }
-    const dailyLimit = parseUnits(process.env.MAX_SESSION_DAILY_BUY_ETH || '0', 18);
-    const spentToday = BigInt(session.dailyBuyWei || '0');
-    if (dailyLimit > 0n && spentToday + rawAmountIn > dailyLimit) throw new Error('Session daily buy limit reached');
-
     if (nativeBalance < rawAmountIn + parseUnits('0.00002', 18)) throw new Error('Insufficient ETH for buy and gas');
+
+    // Bump batches reserve their complete ten-wallet total atomically before
+    // starting concurrent swaps. Volume mode preserves its success-only counter.
+    const volumeSpentBefore = mode !== 'bump' ? checkDailyBuy(session, rawAmountIn) : undefined;
 
     const amountOutMinimum = await quotePoolMinimum(pool, tokenCA as Address, true, rawAmountIn);
     const data = pool.poolVersion === 'v4'
@@ -405,7 +417,7 @@ async function executeSwap(walletPk: string, session: ActiveSession, isBuy: bool
       gas: pool.poolVersion === 'v4' ? 1_200_000n : 950_000n,
     });
     await publicClient.waitForTransactionReceipt({ hash: txHash, confirmations: 1 });
-    session.dailyBuyWei = (spentToday + rawAmountIn).toString();
+    if (volumeSpentBefore !== undefined) session.dailyBuyWei = (volumeSpentBefore + rawAmountIn).toString();
     return rawAmountIn;
   } else {
     let tokenBalance = 0n;
@@ -520,7 +532,7 @@ function shuffled<T>(items: T[]): T[] {
   return result;
 }
 
-async function recordSwapFailure(chatId: number, session: ActiveSession, error: any): Promise<void> {
+async function recordSwapFailure(chatId: number, session: ActiveSession, error: any, delayMs = 1800): Promise<void> {
   session.failedSwaps++;
   session.lastActivityAt = Date.now();
   const reason = error?.message || String(error);
@@ -530,7 +542,7 @@ async function recordSwapFailure(chatId: number, session: ActiveSession, error: 
   }
   savePlatformState();
   log(`Swap error chatId ${chatId}: ${reason}`, 'ERROR');
-  await sleep(1800);
+  if (delayMs > 0) await sleep(delayMs);
 }
 
 async function runBumpCycle(chatId: number, session: ActiveSession, endTime: number): Promise<void> {
@@ -542,18 +554,28 @@ async function runBumpCycle(chatId: number, session: ActiveSession, endTime: num
     // Every round reorders the same persistent pool. Later rounds sometimes
     // skip a few wallets so the sequence does not look mechanically identical.
     const roundWallets = shuffled(wallets).slice(0, bumpRoundWalletCount(wallets.length));
-    for (const wallet of roundWallets) {
-      if (!session.running || Date.now() >= endTime) return;
-      if (session.paused) return;
+    for (let offset = 0; offset < roundWallets.length; offset += BUMP_BUY_CONCURRENCY) {
+      if (!session.running || Date.now() >= endTime || session.paused) return;
+      const batch = roundWallets.slice(offset, offset + BUMP_BUY_CONCURRENCY);
       try {
-        await executeSwap(wallet.privateKey, session, true);
-        session.completedBuys++;
-        session.lastActivityAt = Date.now();
-        savePlatformState();
+        // One reservation prevents ten concurrent wallets from reading and
+        // overwriting the same daily-spend counter.
+        reserveDailyBuy(session, BUMP_BUY_WEI * BigInt(batch.length));
       } catch (error: any) {
         await recordSwapFailure(chatId, session, error);
+        return;
       }
-      await sleep(jitter(650, 1150));
+      const results = await Promise.allSettled(batch.map(wallet => executeSwap(wallet.privateKey, session, true)));
+      for (const result of results) {
+        if (result.status === 'fulfilled') {
+          session.completedBuys++;
+          session.lastActivityAt = Date.now();
+        } else {
+          await recordSwapFailure(chatId, session, result.reason, 0);
+        }
+      }
+      savePlatformState();
+      await sleep(jitter(850, 1250));
     }
   }
 
@@ -583,7 +605,7 @@ async function startVolume(chatId: number, resumed = false): Promise<void> {
   const ratioLabel = session.mode === 'bump'
     ? '6–12 multi-wallet buy rounds, then 20–35% of wallets sell'
     : 'Random 1:1 / 2:1 / 3:1 (2:1 most common)';
-  const tradeSizeLabel = session.mode === 'bump' ? '\n🔹 Buy size: 0.00001 ETH each' : '';
+  const tradeSizeLabel = session.mode === 'bump' ? '\n🔹 Buy size: 0.00001 ETH each\n⚡ Concurrent buys: up to 10 wallets' : '';
 
   bot.sendMessage(chatId, `${resumed ? '♻️ *Session Resumed After Restart*' : '🚀 *Bot Started*'}\n\n⚙️ Mode: ${modeLabel}\n📛 Token: ${tokenInfo.name} (${tokenInfo.symbol})\n🔗 CA: \`${session.tokenCA}\`\n💎 Package: ${session.package}\n⚖️ Pattern: ${ratioLabel}${tradeSizeLabel}\n⏱ Remaining: ${Math.max(0, Math.ceil((endTime - Date.now()) / 60000))} min\n👥 Reusable wallets: ${session.wallets.length}`, { parse_mode: 'Markdown' }).catch(() => {});
   savePlatformState();
@@ -1327,7 +1349,7 @@ bot.onText(/^\/support(?:@\w+)?\s+([\s\S]{3,500})$/, (msg, match) => {
 
 bot.onText(/^\/bump(?:@\w+)?$/, (msg) => {
   userStates.set(msg.chat.id, { step: 'ca', mode: 'bump' as BotMode });
-  bot.sendMessage(msg.chat.id, '📈 *Micro Bump Mode*\n\nUses 8–32 reusable wallets for repeated 0.00001 ETH buys. Each cycle makes 6–12 multi-wallet buy rounds before only 20–35% of wallets sell. About 70% of wallets are reused on later bump orders.\n\nThese are controlled-wallet transactions, not organic traders.\n\n🔗 Paste the token contract address (CA):', { parse_mode: 'Markdown' });
+  bot.sendMessage(msg.chat.id, '📈 *Micro Bump Mode*\n\nUses 30–100 reusable wallets depending on package. Buys are 0.00001 ETH and execute in concurrent groups of up to 10 wallets. Each cycle makes 6–12 multi-wallet buy rounds before only 20–35% of wallets sell. About 70% of wallets are reused on later bump orders.\n\nThese are controlled-wallet transactions, not organic traders.\n\n🔗 Paste the token contract address (CA):', { parse_mode: 'Markdown' });
 });
 
 bot.onText(/\/myorders/, (msg) => {
@@ -1498,7 +1520,7 @@ bot.on('callback_query', async (query) => {
     bot.sendMessage(chatId, '🔗 Paste the token contract address (CA):');
   } else if (data === 'start_bump') {
     userStates.set(chatId, { step: 'ca', mode: 'bump' as BotMode });
-    bot.sendMessage(chatId, '📈 *Micro Bump Mode*\n\nUses 8–32 reusable wallets for repeated 0.00001 ETH buys. Each cycle makes 6–12 multi-wallet buy rounds before only 20–35% of wallets sell. About 70% of wallets are reused on later bump orders.\n\nThese are controlled-wallet transactions, not organic traders.\n\n🔗 Paste the token contract address (CA):', { parse_mode: 'Markdown' });
+    bot.sendMessage(chatId, '📈 *Micro Bump Mode*\n\nUses 30–100 reusable wallets depending on package. Buys are 0.00001 ETH and execute in concurrent groups of up to 10 wallets. Each cycle makes 6–12 multi-wallet buy rounds before only 20–35% of wallets sell. About 70% of wallets are reused on later bump orders.\n\nThese are controlled-wallet transactions, not organic traders.\n\n🔗 Paste the token contract address (CA):', { parse_mode: 'Markdown' });
   } else if (data.startsWith('pkg_')) {
     const pkgMap: Record<string, string> = { 
       pkg_test: '0.02',
@@ -1537,7 +1559,7 @@ bot.on('callback_query', async (query) => {
       const selectedMode = state.mode === 'bump' ? 'Micro Bump' : 'Volume';
       const walletCount = getWalletCount(state.package, state.mode === 'bump' ? 'bump' : 'volume');
       const pattern = state.mode === 'bump'
-        ? '0.00001 ETH buys • 6–12 rounds • few sells • 70% wallet reuse'
+        ? '0.00001 ETH buys • 10 concurrent • 6–12 rounds • few sells • 70% reuse'
         : 'Random 1:1 / 2:1 / 3:1';
       bot.sendMessage(chatId, `✅ Package and duration selected.\n\nMode: *${selectedMode}*\nWallets: *${walletCount}*\nPattern: *${pattern}*\n\nReply *YES* to continue with \`${state.tokenCA}\`.`, { parse_mode: 'Markdown' });
     }
