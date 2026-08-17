@@ -71,9 +71,11 @@ const publicClient = createPublicClient({
 // Telegram can reject a single outgoing message (for example, malformed
 // formatting). That reply must not terminate the long-running worker.
 process.on('unhandledRejection', reason => {
-  const telegramError = reason as { code?: string; message?: string };
-  if (telegramError?.code === 'ETELEGRAM') {
-    console.error(`[Telegram API error] ${telegramError.message || String(reason)}`);
+  const telegramError = reason as { code?: string; name?: string; message?: string };
+  if (telegramError?.code === 'ETELEGRAM' || telegramError?.code === 'EFATAL' || telegramError?.name === 'FatalError') {
+    // Transient Telegram network failures are retried by the polling client.
+    // They must not restart the worker and interrupt swaps/payment verification.
+    console.error(`[Telegram transport error: ${telegramError.code || telegramError.name}] ${telegramError.message || String(reason)}`);
     return;
   }
   setImmediate(() => {
