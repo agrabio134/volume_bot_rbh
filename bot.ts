@@ -6,6 +6,8 @@ import {
   encodeFunctionData,
   maxUint256,
   isAddress,
+  type Address,
+  type Hex,
 } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import TelegramBot, { type Message } from 'node-telegram-bot-api';
@@ -15,12 +17,17 @@ import * as path from 'path';
 import crypto from 'crypto';
 import {
   robinhood, HUH_TOKEN, WETH_TOKEN, HUH_WETH_POOL, POOL_FEE, SWAP_ROUTER,
-  QUOTER_V2, COMMISSION_WALLET, CONTROLLER_WALLET, getRpcTransport,
+  QUOTER_V2, V4_POOL_MANAGER, V4_QUOTER, UNIVERSAL_ROUTER, PERMIT2, NATIVE_ETH,
+  COMMISSION_WALLET, CONTROLLER_WALLET, getRpcTransport,
 } from './chain';
 import {
   PlatformStateStore, SlidingWindowRateLimiter, decryptWalletKeys, defaultUserPreference,
   encryptWalletKeys, makeId, type PaymentOrder, type PersistedSession,
 } from './platform-state';
+import {
+  encodeV4ExactInputSingle, PERMIT2_ABI, V4_POOL_MANAGER_ABI, V4_QUOTER_ABI,
+  type V4PoolKey,
+} from './v4';
 
 dotenv.config();
 
@@ -137,7 +144,34 @@ const POOL_READ_ABI = [
   { name: 'fee', type: 'function', stateMutability: 'view', inputs: [], outputs: [{ type: 'uint24' }] },
 ] as const;
 
-type PoolDiscovery = { poolAddress: `0x${string}`; poolFee: number; liquidityUsd?: number; dexUrl?: string; roundTripBps?: number };
+type PoolDiscovery = {
+  poolVersion: 'v3' | 'v4';
+  poolAddress: string;
+  poolFee: number;
+  poolTickSpacing?: number;
+  poolCurrency0?: Address;
+  poolCurrency1?: Address;
+  poolHooks?: Address;
+  liquidityUsd?: number;
+  dexUrl?: string;
+  roundTripBps?: number;
+};
+
+const isPoolId = (value?: string): value is Hex => /^0x[0-9a-fA-F]{64}$/.test(value || '');
+
+function v4PoolKey(pool: PoolDiscovery): V4PoolKey {
+  if (pool.poolVersion !== 'v4' || !pool.poolCurrency0 || !pool.poolCurrency1 ||
+      pool.poolTickSpacing === undefined || !pool.poolHooks) {
+    throw new Error('V4 pool key is incomplete');
+  }
+  return {
+    currency0: pool.poolCurrency0,
+    currency1: pool.poolCurrency1,
+    fee: pool.poolFee,
+    tickSpacing: pool.poolTickSpacing,
+    hooks: pool.poolHooks,
+  };
+}
 
 async function discoverPool(tokenCA: string): Promise<PoolDiscovery> {
   const normalizedToken = tokenCA.toLowerCase();
@@ -147,22 +181,50 @@ async function discoverPool(tokenCA: string): Promise<PoolDiscovery> {
   if (!pairsResponse.ok) throw new Error(`DEX Screener returned HTTP ${pairsResponse.status}`);
   const pairs = await pairsResponse.json() as Array<{
     pairAddress?: string;
+    labels?: string[];
     baseToken?: { address?: string };
     quoteToken?: { address?: string };
     liquidity?: { usd?: number };
     url?: string;
   }>;
   const candidates = pairs
-    .filter(pair => pair.pairAddress && isAddress(pair.pairAddress))
     .filter(pair => {
       const addresses = [pair.baseToken?.address?.toLowerCase(), pair.quoteToken?.address?.toLowerCase()];
-      return addresses.includes(normalizedToken) && addresses.includes(WETH_TOKEN.toLowerCase());
+      const isV4 = pair.labels?.some(label => label.toLowerCase() === 'v4') && isPoolId(pair.pairAddress);
+      const validPoolIdentifier = isV4 || Boolean(pair.pairAddress && isAddress(pair.pairAddress));
+      const expectedBase = isV4 ? NATIVE_ETH.toLowerCase() : WETH_TOKEN.toLowerCase();
+      return validPoolIdentifier && addresses.includes(normalizedToken) && addresses.includes(expectedBase);
     })
     .sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0));
-  if (!candidates.length) throw new Error('No WETH pool was found for this token on Robinhood Chain');
+  if (!candidates.length) throw new Error('No compatible V3 WETH or V4 native-ETH pool was found for this token');
 
   for (const candidate of candidates) {
     try {
+      if (candidate.labels?.some(label => label.toLowerCase() === 'v4') && isPoolId(candidate.pairAddress)) {
+        const logs = await publicClient.getLogs({
+          address: V4_POOL_MANAGER,
+          event: V4_POOL_MANAGER_ABI[0],
+          args: { id: candidate.pairAddress },
+          fromBlock: 0n,
+          toBlock: 'latest',
+        });
+        const initialized = logs[0]?.args;
+        if (!initialized?.currency0 || !initialized.currency1 || initialized.fee === undefined ||
+            initialized.tickSpacing === undefined || !initialized.hooks) continue;
+        const actualTokens = [initialized.currency0.toLowerCase(), initialized.currency1.toLowerCase()];
+        if (!actualTokens.includes(normalizedToken) || !actualTokens.includes(NATIVE_ETH.toLowerCase())) continue;
+        return {
+          poolVersion: 'v4',
+          poolAddress: candidate.pairAddress,
+          poolFee: Number(initialized.fee),
+          poolTickSpacing: Number(initialized.tickSpacing),
+          poolCurrency0: initialized.currency0,
+          poolCurrency1: initialized.currency1,
+          poolHooks: initialized.hooks,
+          liquidityUsd: candidate.liquidity?.usd,
+          dexUrl: candidate.url,
+        };
+      }
       const poolAddress = candidate.pairAddress as `0x${string}`;
       const [token0, token1, fee] = await Promise.all([
         publicClient.readContract({ address: poolAddress, abi: POOL_READ_ABI, functionName: 'token0' }),
@@ -171,28 +233,28 @@ async function discoverPool(tokenCA: string): Promise<PoolDiscovery> {
       ]);
       const actualTokens = [token0.toLowerCase(), token1.toLowerCase()];
       if (!actualTokens.includes(normalizedToken) || !actualTokens.includes(WETH_TOKEN.toLowerCase())) continue;
-      return { poolAddress, poolFee: Number(fee), liquidityUsd: candidate.liquidity?.usd, dexUrl: candidate.url };
+      return { poolVersion: 'v3', poolAddress, poolFee: Number(fee), liquidityUsd: candidate.liquidity?.usd, dexUrl: candidate.url };
     } catch {
       continue;
     }
   }
-  throw new Error('The discovered pair is not a compatible Uniswap V3 WETH pool');
+  throw new Error('The discovered pair is not a compatible Uniswap V3 or V4 ETH pool');
 }
 
 async function validateTokenAndPool(tokenCA: string): Promise<PoolDiscovery> {
   const bytecode = await publicClient.getBytecode({ address: tokenCA as `0x${string}` });
   if (!bytecode || bytecode === '0x') throw new Error('That address is not a token contract');
   const pool = tokenCA.toLowerCase() === HUH_TOKEN.toLowerCase()
-    ? { poolAddress: HUH_WETH_POOL, poolFee: POOL_FEE }
+    ? { poolVersion: 'v3' as const, poolAddress: HUH_WETH_POOL, poolFee: POOL_FEE }
     : await discoverPool(tokenCA);
   const minimumLiquidityUsd = Number(process.env.MIN_POOL_LIQUIDITY_USD || '1000');
   if (pool.liquidityUsd !== undefined && pool.liquidityUsd < minimumLiquidityUsd) {
     throw new Error(`Pool liquidity is below the $${minimumLiquidityUsd.toLocaleString()} safety minimum`);
   }
   const sampleIn = parseUnits(process.env.SAFETY_QUOTE_ETH || '0.0001', 18);
-  const tokenOut = await quoteRaw(WETH_TOKEN, tokenCA as `0x${string}`, sampleIn, pool.poolFee);
+  const tokenOut = await quotePoolRaw(pool, tokenCA as Address, true, sampleIn);
   if (tokenOut <= 0n) throw new Error('Buy quote returned zero');
-  const wethBack = await quoteRaw(tokenCA as `0x${string}`, WETH_TOKEN, tokenOut, pool.poolFee);
+  const wethBack = await quotePoolRaw(pool, tokenCA as Address, false, tokenOut);
   const roundTripBps = Number((wethBack * 10_000n) / sampleIn);
   const minimumRoundTripBps = Number(process.env.MIN_ROUND_TRIP_BPS || '5000');
   if (roundTripBps < minimumRoundTripBps) {
@@ -201,7 +263,7 @@ async function validateTokenAndPool(tokenCA: string): Promise<PoolDiscovery> {
   return { ...pool, roundTripBps };
 }
 
-async function quoteRaw(tokenIn: `0x${string}`, tokenOut: `0x${string}`, amountIn: bigint, fee: number): Promise<bigint> {
+async function quoteV3Raw(tokenIn: Address, tokenOut: Address, amountIn: bigint, fee: number): Promise<bigint> {
   const { result } = await publicClient.simulateContract({
     address: QUOTER_V2, abi: QUOTER_ABI, functionName: 'quoteExactInputSingle',
     args: [{ tokenIn, tokenOut, amountIn, fee, sqrtPriceLimitX96: 0n }],
@@ -209,10 +271,40 @@ async function quoteRaw(tokenIn: `0x${string}`, tokenOut: `0x${string}`, amountI
   return result[0];
 }
 
-async function quoteMinimum(tokenIn: `0x${string}`, tokenOut: `0x${string}`, amountIn: bigint, fee: number) {
-  const quoted = await quoteRaw(tokenIn, tokenOut, amountIn, fee);
+async function quotePoolRaw(pool: PoolDiscovery, tokenCA: Address, isBuy: boolean, amountIn: bigint): Promise<bigint> {
+  if (pool.poolVersion === 'v3') {
+    return isBuy
+      ? quoteV3Raw(WETH_TOKEN, tokenCA, amountIn, pool.poolFee)
+      : quoteV3Raw(tokenCA, WETH_TOKEN, amountIn, pool.poolFee);
+  }
+  const key = v4PoolKey(pool);
+  const tokenIs0 = key.currency0.toLowerCase() === tokenCA.toLowerCase();
+  const zeroForOne = isBuy ? !tokenIs0 : tokenIs0;
+  const { result } = await publicClient.simulateContract({
+    address: V4_QUOTER,
+    abi: V4_QUOTER_ABI,
+    functionName: 'quoteExactInputSingle',
+    args: [{ poolKey: key, zeroForOne, exactAmount: amountIn, hookData: '0x' }],
+  });
+  return result[0];
+}
+
+async function quotePoolMinimum(pool: PoolDiscovery, tokenCA: Address, isBuy: boolean, amountIn: bigint) {
+  const quoted = await quotePoolRaw(pool, tokenCA, isBuy, amountIn);
   const slippageBps = BigInt(Math.max(1, Math.min(1_500, Number(process.env.MAX_SLIPPAGE_BPS || '300'))));
   return (quoted * (10_000n - slippageBps)) / 10_000n;
+}
+
+function poolFromSession(session: ActiveSession): PoolDiscovery {
+  return {
+    poolVersion: session.poolVersion || 'v3',
+    poolAddress: session.poolAddress || HUH_WETH_POOL,
+    poolFee: session.poolFee || POOL_FEE,
+    poolTickSpacing: session.poolTickSpacing,
+    poolCurrency0: session.poolCurrency0 as Address | undefined,
+    poolCurrency1: session.poolCurrency1 as Address | undefined,
+    poolHooks: session.poolHooks as Address | undefined,
+  };
 }
 
 function log(message: string, level: 'INFO' | 'WARN' | 'ERROR' = 'INFO') {
@@ -241,7 +333,7 @@ async function executeSwap(walletPk: string, session: ActiveSession, isBuy: bool
   const account = privateKeyToAccount(walletPk as `0x${string}`);
   const walletClient = createWalletClient({ chain: robinhood, transport: getRpcTransport(), account });
   const tokenInfo = await getTokenInfo(tokenCA);
-  const router = SWAP_ROUTER;
+  const pool = poolFromSession(session);
 
   const nativeBalance = await publicClient.getBalance({ address: account.address });
   const maximumGasGwei = Number(process.env.MAX_GAS_PRICE_GWEI || '0');
@@ -267,16 +359,28 @@ async function executeSwap(walletPk: string, session: ActiveSession, isBuy: bool
 
     if (nativeBalance < rawAmountIn + parseUnits('0.00002', 18)) throw new Error('Insufficient ETH for buy and gas');
 
-    const amountOutMinimum = await quoteMinimum(WETH_TOKEN, tokenCA as `0x${string}`, rawAmountIn, session.poolFee || POOL_FEE);
+    const amountOutMinimum = await quotePoolMinimum(pool, tokenCA as Address, true, rawAmountIn);
+    const data = pool.poolVersion === 'v4'
+      ? encodeV4ExactInputSingle({
+          poolKey: v4PoolKey(pool),
+          zeroForOne: v4PoolKey(pool).currency0.toLowerCase() !== tokenCA.toLowerCase(),
+          amountIn: rawAmountIn,
+          amountOutMinimum,
+          currencyIn: NATIVE_ETH,
+          currencyOut: tokenCA as Address,
+          deadline: BigInt(Math.floor(Date.now() / 1000) + 600),
+        })
+      : encodeFunctionData({
+          abi: ROUTER_ABI,
+          functionName: 'exactInputSingle',
+          args: [{ tokenIn: WETH_TOKEN, tokenOut: tokenCA as Address, fee: pool.poolFee, recipient: account.address, amountIn: rawAmountIn, amountOutMinimum, sqrtPriceLimitX96: 0n }],
+        });
 
-    const data = encodeFunctionData({
-      abi: ROUTER_ABI,
-      functionName: 'exactInputSingle',
-      args: [{ tokenIn: WETH_TOKEN, tokenOut: tokenCA as `0x${string}`, fee: session.poolFee || POOL_FEE, recipient: account.address, amountIn: rawAmountIn, amountOutMinimum, sqrtPriceLimitX96: 0n }],
-    });
-
-    const txHash = await walletClient.sendTransaction({ 
-      to: router, data, value: rawAmountIn, gas: 950000n 
+    const txHash = await walletClient.sendTransaction({
+      to: pool.poolVersion === 'v4' ? UNIVERSAL_ROUTER : SWAP_ROUTER,
+      data,
+      value: rawAmountIn,
+      gas: pool.poolVersion === 'v4' ? 1_200_000n : 950_000n,
     });
     await publicClient.waitForTransactionReceipt({ hash: txHash, confirmations: 1 });
     session.dailyBuyWei = (spentToday + rawAmountIn).toString();
@@ -301,11 +405,12 @@ async function executeSwap(walletPk: string, session: ActiveSession, isBuy: bool
       : 9700n + BigInt(Math.floor(Math.random() * 200)); // 97% to 99%
     const rawAmountIn = (tokenBalance * sellPercentage) / 10000n;
 
-    const allowance = await publicClient.readContract({ 
+    const allowanceTarget = pool.poolVersion === 'v4' ? PERMIT2 : SWAP_ROUTER;
+    const allowance = await publicClient.readContract({
       address: tokenCA as `0x${string}`, 
       abi: ERC20_ABI, 
       functionName: 'allowance', 
-      args: [account.address, router] 
+      args: [account.address, allowanceTarget]
     }) as bigint;
 
     if (allowance < rawAmountIn) {
@@ -313,25 +418,63 @@ async function executeSwap(walletPk: string, session: ActiveSession, isBuy: bool
         address: tokenCA as `0x${string}`,
         abi: ERC20_ABI,
         functionName: 'approve',
-        args: [router, maxUint256],
+        args: [allowanceTarget, maxUint256],
         gas: 170000n,
       });
       await publicClient.waitForTransactionReceipt({ hash: approveTx, confirmations: 1 });
       await sleep(1350);
     }
 
-    const amountOutMinimum = await quoteMinimum(tokenCA as `0x${string}`, WETH_TOKEN, rawAmountIn, session.poolFee || POOL_FEE);
-    const swapData = encodeFunctionData({
-      abi: ROUTER_ABI,
-      functionName: 'exactInputSingle',
-      args: [{ tokenIn: tokenCA as `0x${string}`, tokenOut: WETH_TOKEN, fee: session.poolFee || POOL_FEE, recipient: router, amountIn: rawAmountIn, amountOutMinimum, sqrtPriceLimitX96: 0n }],
-    });
-    const unwrapData = encodeFunctionData({ abi: ROUTER_ABI, functionName: 'unwrapWETH9', args: [amountOutMinimum, account.address] });
-    const data = encodeFunctionData({ abi: ROUTER_ABI, functionName: 'multicall', args: [[swapData, unwrapData]] });
+    if (pool.poolVersion === 'v4') {
+      const [permitAmount, permitExpiration] = await publicClient.readContract({
+        address: PERMIT2,
+        abi: PERMIT2_ABI,
+        functionName: 'allowance',
+        args: [account.address, tokenCA as Address, UNIVERSAL_ROUTER],
+      });
+      if (permitAmount < rawAmountIn || Number(permitExpiration) < Math.floor(Date.now() / 1000) + 3_600) {
+        const permitTx = await walletClient.writeContract({
+          address: PERMIT2,
+          abi: PERMIT2_ABI,
+          functionName: 'approve',
+          args: [tokenCA as Address, UNIVERSAL_ROUTER, (1n << 160n) - 1n, Number((1n << 48n) - 1n)],
+          gas: 140000n,
+        });
+        await publicClient.waitForTransactionReceipt({ hash: permitTx, confirmations: 1 });
+        await sleep(1350);
+      }
+    }
 
-    const txHash = await walletClient.sendTransaction({ 
-      to: router, data, value: 0n, gas: 950000n 
-    });
+    const amountOutMinimum = await quotePoolMinimum(pool, tokenCA as Address, false, rawAmountIn);
+    let data: Hex;
+    let target: Address;
+    let gas: bigint;
+    if (pool.poolVersion === 'v4') {
+      const key = v4PoolKey(pool);
+      data = encodeV4ExactInputSingle({
+        poolKey: key,
+        zeroForOne: key.currency0.toLowerCase() === tokenCA.toLowerCase(),
+        amountIn: rawAmountIn,
+        amountOutMinimum,
+        currencyIn: tokenCA as Address,
+        currencyOut: NATIVE_ETH,
+        deadline: BigInt(Math.floor(Date.now() / 1000) + 600),
+      });
+      target = UNIVERSAL_ROUTER;
+      gas = 1_200_000n;
+    } else {
+      const swapData = encodeFunctionData({
+        abi: ROUTER_ABI,
+        functionName: 'exactInputSingle',
+        args: [{ tokenIn: tokenCA as Address, tokenOut: WETH_TOKEN, fee: pool.poolFee, recipient: SWAP_ROUTER, amountIn: rawAmountIn, amountOutMinimum, sqrtPriceLimitX96: 0n }],
+      });
+      const unwrapData = encodeFunctionData({ abi: ROUTER_ABI, functionName: 'unwrapWETH9', args: [amountOutMinimum, account.address] });
+      data = encodeFunctionData({ abi: ROUTER_ABI, functionName: 'multicall', args: [[swapData, unwrapData]] });
+      target = SWAP_ROUTER;
+      gas = 950_000n;
+    }
+
+    const txHash = await walletClient.sendTransaction({ to: target, data, value: 0n, gas });
     await publicClient.waitForTransactionReceipt({ hash: txHash, confirmations: 1 });
     return 0n;
   }
@@ -565,7 +708,12 @@ async function handlePayment(chatId: number, expectedAmount: string, state: any)
             endTime: Date.now() + state.durationMs,
             orderId: order.id,
             poolAddress: state.poolAddress,
+            poolVersion: state.poolVersion,
             poolFee: state.poolFee,
+            poolTickSpacing: state.poolTickSpacing,
+            poolCurrency0: state.poolCurrency0,
+            poolCurrency1: state.poolCurrency1,
+            poolHooks: state.poolHooks,
             completedBuys: 0,
             completedSells: 0,
             failedSwaps: 0,
@@ -827,15 +975,16 @@ bot.onText(/^\/demo(?:@\w+)?(?:\s+(0x[a-fA-F0-9]{40}))?$/, async (msg, match) =>
   try {
     const [info, pool] = await Promise.all([getTokenInfo(tokenCA), validateTokenAndPool(tokenCA)]);
     const sampleIn = parseUnits('0.001', 18);
-    const quoted = await quoteMinimum(WETH_TOKEN, tokenCA as `0x${string}`, sampleIn, pool.poolFee);
+    const quoted = await quotePoolMinimum(pool, tokenCA as Address, true, sampleIn);
     await bot.sendMessage(msg.chat.id, [
       '🧪 DEMO QUOTE — no funds moved',
       `${info.name} (${info.symbol})`,
       `Input: 0.001 ETH`,
       `Estimated minimum output: ${formatUnits(quoted, info.decimals)} ${info.symbol}`,
+      `Protocol: Uniswap ${pool.poolVersion.toUpperCase()}`,
       `Pool fee: ${pool.poolFee}`,
       `Liquidity: ${pool.liquidityUsd === undefined ? 'not supplied' : `$${pool.liquidityUsd.toLocaleString()}`}`,
-      'Contract and WETH pool validation: PASSED',
+      'Contract and pool validation: PASSED',
     ].join('\n'));
   } catch (error: any) {
     await bot.sendMessage(msg.chat.id, `❌ Demo validation failed: ${error?.message || error}`);
@@ -1129,8 +1278,13 @@ bot.on('message', async (msg) => {
       const [info, pool] = await Promise.all([getTokenInfo(text), validateTokenAndPool(text)]);
       state.tokenCA = text;
       state.poolAddress = pool.poolAddress;
+      state.poolVersion = pool.poolVersion;
       state.poolFee = pool.poolFee;
-      bot.sendMessage(chatId, `✅ *Token & Pool Validated*\n📛 Name: ${info.name}\n🔤 Symbol: ${info.symbol}\n🔗 CA: \`${text}\`\n🏊 Pool: \`${pool.poolAddress}\`\n💧 Liquidity: ${pool.liquidityUsd === undefined ? 'not supplied' : `$${pool.liquidityUsd.toLocaleString()}`}\n🛡 Round-trip quote: ${((pool.roundTripBps || 0) / 100).toFixed(2)}%`, { parse_mode: 'Markdown' });
+      state.poolTickSpacing = pool.poolTickSpacing;
+      state.poolCurrency0 = pool.poolCurrency0;
+      state.poolCurrency1 = pool.poolCurrency1;
+      state.poolHooks = pool.poolHooks;
+      bot.sendMessage(chatId, `✅ Token & Pool Validated\n📛 Name: ${info.name}\n🔤 Symbol: ${info.symbol}\n🧩 Protocol: Uniswap ${pool.poolVersion.toUpperCase()}\n🔗 CA: ${text}\n🏊 Pool: ${pool.poolAddress}\n💧 Liquidity: ${pool.liquidityUsd === undefined ? 'not supplied' : `$${pool.liquidityUsd.toLocaleString()}`}\n🛡 Round-trip quote: ${((pool.roundTripBps || 0) / 100).toFixed(2)}%`);
       state.step = 'package';
       await sendPackageMenu(chatId);
     } catch (error: any) {

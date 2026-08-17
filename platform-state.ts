@@ -7,7 +7,12 @@ export type PersistedWallet = { privateKey: string };
 export type PersistedSession = {
   tokenCA: string;
   poolAddress?: string;
+  poolVersion?: 'v3' | 'v4';
   poolFee?: number;
+  poolTickSpacing?: number;
+  poolCurrency0?: string;
+  poolCurrency1?: string;
+  poolHooks?: string;
   running: boolean;
   paused: boolean;
   package: string;

@@ -46,7 +46,7 @@ Invoices record the creation block. Verification scans confirmed native transfer
 
 ## Trading safety
 
-Before an invoice is created, the bot checks contract bytecode, discovers and verifies the WETH pool, enforces the configured liquidity minimum, and runs a two-way quote. Each swap uses a quote-derived minimum output and can enforce gas-price and daily-buy limits. `/stopalladmin` is the emergency stop.
+Before an invoice is created, the volume bot checks contract bytecode, discovers and verifies a Uniswap V3 WETH or V4 native-ETH pool, enforces the configured liquidity minimum, and runs a two-way quote. V3 swaps use SwapRouter02; V4 swaps use Robinhood Chain's official PoolManager, V4Quoter, Universal Router and Permit2 deployments. Each swap uses a quote-derived minimum output and can enforce gas-price and daily-buy limits. `/stopalladmin` is the emergency stop.
 
 These checks reduce operational risk but cannot prove a token is safe or guarantee execution price. Keep limits conservative and test with `/demo` first.
 
