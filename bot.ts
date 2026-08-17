@@ -44,6 +44,19 @@ const publicClient = createPublicClient({
   transport: getRpcTransport(),
 });
 
+// Telegram can reject a single outgoing message (for example, malformed
+// formatting). That reply must not terminate the long-running worker.
+process.on('unhandledRejection', reason => {
+  const telegramError = reason as { code?: string; message?: string };
+  if (telegramError?.code === 'ETELEGRAM') {
+    console.error(`[Telegram API error] ${telegramError.message || String(reason)}`);
+    return;
+  }
+  setImmediate(() => {
+    throw reason instanceof Error ? reason : new Error(String(reason));
+  });
+});
+
 type BotMode = 'volume' | 'bump';
 
 type ActiveSession = PersistedSession;
@@ -988,7 +1001,7 @@ bot.onText(/\/active/, (msg) => {
 bot.onText(/\/help/, (msg) => {
   if (currentUser(msg.chat.id).language === 'fil') {
     return void bot.sendMessage(msg.chat.id,
-`📋 *Mga Command*
+`📋 Mga Command
 
 /start - Pumili ng mode
 /myorders - Aktibong session
@@ -997,10 +1010,10 @@ bot.onText(/\/help/, (msg) => {
 /health - Kalagayan ng serbisyo
 /demo [CA] - Ligtas na quote lamang
 /support MENSAHE - Humingi ng tulong
-/language en - Bumalik sa English`, { parse_mode: 'Markdown' });
+/language en - Bumalik sa English`).catch(error => log(`Help reply failed: ${error.message}`, 'ERROR'));
   }
   bot.sendMessage(msg.chat.id, 
-`📋 *Available Commands*
+`📋 Available Commands
 
 /start - Choose volume or bump mode
 /bump - Start random bump mode
@@ -1017,8 +1030,10 @@ bot.onText(/\/help/, (msg) => {
 /language en|fil - Choose language
 /timezone Asia/Manila - Set timezone
 /support MESSAGE - Contact support
-/stop - Stop current bot
-/help - This message`, { parse_mode: 'Markdown' });
+/help - This message
+
+To pause, resume or stop a session, use the buttons in /myorders.`)
+    .catch(error => log(`Help reply failed: ${error.message}`, 'ERROR'));
 });
 
 function sendPackageMenu(chatId: number) {
